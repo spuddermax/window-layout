@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Window Layouts
+GenericName=Window Layout Restore
+Comment=Pick a saved window layout and put your windows back
+Exec=/home/matthew/projects/window-layout/window_layout_gui.py
+Icon=window-layout
+Terminal=false
+StartupNotify=true
+StartupWMClass=window-layout
+Categories=Utility;
+Keywords=window;layout;restore;crash;session;

@@ -70,6 +70,8 @@ STATES = {"_NET_WM_STATE_MAXIMIZED_VERT": "maximized_vert",
           "_NET_WM_STATE_ABOVE": "above",
           "_NET_WM_STATE_SHADED": "shaded",
           "_NET_WM_STATE_HIDDEN": "hidden"}
+#: The picker's own WM_CLASS: never snapshotted, never moved.
+OWN_CLASS = "window-layout"
 #: How long to let the window manager act on a request before reading back.
 SETTLE_S = 0.15
 
@@ -171,7 +173,7 @@ def read_windows() -> list[Window]:
                 "xprop", "-id", win.id, "_NET_WM_STATE", "_NET_WM_WINDOW_TYPE"))
         except subprocess.CalledProcessError:
             continue                              # gone since wmctrl saw it
-        if types & SKIP_TYPES:
+        if types & SKIP_TYPES or win.wm_class.startswith(OWN_CLASS):
             continue
         win.states = states
         win.command = _command(win.pid)
@@ -209,10 +211,13 @@ def session_key() -> str:
 
 
 def _layout(windows: list[Window]) -> list[dict]:
-    """What makes two snapshots the same layout: everything but window ids
-    and pids, in a stable order."""
+    """What makes two snapshots the same layout: everything but window ids,
+    pids and titles, in a stable order.  Titles help match a window but are
+    not where it is -- and a busy terminal's title has a spinner in it, a
+    browser's is its tab, so counting them would save a "new" layout every
+    two minutes."""
     return sorted(({k: v for k, v in asdict(w).items()
-                    if k not in ("id", "pid")} for w in windows),
+                    if k not in ("id", "pid", "title")} for w in windows),
                   key=lambda d: json.dumps(d, sort_keys=True))
 
 
@@ -224,8 +229,9 @@ def load(path: Path) -> dict:
     return data
 
 
-def snapshots(folder: Path = SNAPSHOTS) -> list[dict]:
+def snapshots(folder: Path | None = None) -> list[dict]:
     """Every snapshot on file, oldest first; unreadable ones skipped."""
+    folder = folder or SNAPSHOTS
     out = []
     for path in sorted(folder.glob("*.json")):
         try:
@@ -236,12 +242,14 @@ def snapshots(folder: Path = SNAPSHOTS) -> list[dict]:
 
 
 def save(windows: list[Window], monitors: list[Monitor], session: str,
-         folder: Path = SNAPSHOTS, now: datetime | None = None) -> Path | None:
+         folder: Path | None = None,
+         now: datetime | None = None) -> Path | None:
     """Write a snapshot if the layout differs from the last one of this
     session; return its path, or None when nothing changed (or there is
     nothing to save)."""
     if not windows:
         return None
+    folder = folder or SNAPSHOTS
     folder.mkdir(parents=True, exist_ok=True)
     same_session = [s for s in snapshots(folder) if s["session"] == session]
     if same_session and _layout(same_session[-1]["windows"]) == _layout(windows):
@@ -259,9 +267,11 @@ def save(windows: list[Window], monitors: list[Monitor], session: str,
     return path
 
 
-def prune(folder: Path = SNAPSHOTS, now: datetime | None = None) -> list[Path]:
+def prune(folder: Path | None = None,
+          now: datetime | None = None) -> list[Path]:
     """Drop snapshots older than KEEP_DAYS, except the last of each of the
     newest KEEP_SESSIONS sessions.  Returns what was removed."""
+    folder = folder or SNAPSHOTS
     now = now or datetime.now()
     every = snapshots(folder)
     last_of = {}
@@ -351,6 +361,30 @@ def fit(rect: tuple[int, int, int, int],
     return x, y, w, h
 
 
+@dataclass
+class Step:
+    """One saved window and what a restore does about it: the open window
+    it goes to (None when that app is not open), and the geometry to give
+    it, moved onto a monitor that is here now when its own is not."""
+    saved: Window
+    now: Window | None
+    rect: tuple[int, int, int, int]
+    offscreen: bool = False
+
+
+def plan(saved: list[Window], current: list[Window],
+         monitors: list[Monitor]) -> list[Step]:
+    """Every saved window, in saved order, with its match and target."""
+    pairs = {id(s): c for s, c in match(saved, current)}
+    steps = []
+    for s in saved:
+        rect, offscreen = s.rect, False
+        if monitors and not on_screen(rect, monitors):
+            rect, offscreen = fit(rect, monitors), True
+        steps.append(Step(s, pairs.get(id(s)), rect, offscreen))
+    return steps
+
+
 # ---------------------------------------------------------------------------
 # Moving windows
 # ---------------------------------------------------------------------------
@@ -421,6 +455,15 @@ def cmd_snapshot(args) -> int:
     return 0
 
 
+def app_name(w: Window) -> str:
+    """`brave-browser.Brave-browser` -> `Brave-browser`."""
+    return w.wm_class.split(".")[-1] or w.wm_class
+
+
+def workspace_label(w: Window) -> str:
+    return "all" if w.desktop < 0 else str(w.desktop + 1)
+
+
 def _short(text: str, n: int = 60) -> str:
     return text if len(text) <= n else text[:n - 1] + "…"
 
@@ -432,43 +475,39 @@ def cmd_restore(args) -> int:
         print(f"no snapshot to restore ({args.which!r}); "
               f"`window-layout list` shows what there is", file=sys.stderr)
         return 1
-    current = read_windows()
-    monitors = read_monitors()
+    steps = plan(snap["windows"], read_windows(), read_monitors())
     desktops = desktop_count()
-    pairs = match(snap["windows"], current)
+    placed = [st for st in steps if st.now]
+    missing = [st.saved for st in steps if not st.now]
     print(f"restoring {snap['path'].name} (taken {snap['taken']}): "
-          f"{len(pairs)} of {len(snap['windows'])} windows are open"
+          f"{len(placed)} of {len(steps)} windows are open"
           + (" -- dry run" if args.dry_run else ""))
-    for saved, now in pairs:
-        rect = saved.rect
-        note = ""
-        if not on_screen(rect, monitors):
-            rect = fit(rect, monitors)
-            note = "  (its monitor is not connected; moved onto this one)"
-        state = f" [{', '.join(saved.states)}]" if saved.states else ""
-        desk = "all" if saved.desktop < 0 else saved.desktop + 1
-        print(f"  {saved.wm_class.split('.')[-1]:<16} {_short(now.title, 50):<50} "
-              f"-> ws {desk} {rect[0]},{rect[1]} {rect[2]}x{rect[3]}{state}{note}")
+    for st in placed:
+        x, y, w, h = st.rect
+        state = f" [{', '.join(st.saved.states)}]" if st.saved.states else ""
+        note = ("  (its monitor is not connected; moved onto this one)"
+                if st.offscreen else "")
+        print(f"  {app_name(st.saved):<16} {_short(st.now.title, 50):<50} "
+              f"-> ws {workspace_label(st.saved)} {x},{y} {w}x{h}"
+              f"{state}{note}")
         if not args.dry_run:
             try:
-                place(now.id, saved, rect, desktops)
+                place(st.now.id, st.saved, st.rect, desktops)
             except subprocess.CalledProcessError as exc:
                 print(f"    could not move it: {exc.stderr.strip() or exc}")
-    matched = {id(s) for s, _ in pairs}
-    missing = [s for s in snap["windows"] if id(s) not in matched]
     if args.notify:
-        apps = sorted({s.wm_class.split(".")[-1] for s in missing})
-        body = f"{len(pairs)} of {len(snap['windows'])} windows put back " \
+        apps = sorted({app_name(s) for s in missing})
+        body = f"{len(placed)} of {len(steps)} windows put back " \
                f"(layout of {snap['taken'].replace('T', ' ')})."
         if apps:
             body += f"\nNot open: {', '.join(apps)}. Open them and restore again."
-        subprocess.run(["notify-send", "-i", "preferences-system-windows",
+        subprocess.run(["notify-send", "-i", "window-layout",
                         "Window layout restored", body], capture_output=True)
     if missing:
         print(f"\nnot open now ({len(missing)}) -- open these and run "
               f"`window-layout restore` again to place them:")
         for s in missing:
-            print(f"  {s.wm_class.split('.')[-1]:<16} {_short(s.title, 50)}")
+            print(f"  {app_name(s):<16} {_short(s.title, 50)}")
             if s.command:
                 print(f"  {'':<16} $ {_short(s.command, 100)}")
     return 0
@@ -489,7 +528,7 @@ def cmd_list(args) -> int:
               f"{mark}: {len(snaps)} snapshot(s), "
               f"{snaps[0]['taken']} .. {snaps[-1]['taken']}")
         for snap in snaps[-args.last:]:
-            apps = sorted({w.wm_class.split('.')[-1] for w in snap["windows"]})
+            apps = sorted({app_name(w) for w in snap["windows"]})
             print(f"  {snap['path'].stem}  {len(snap['windows']):>2} windows  "
                   f"{_short(', '.join(apps), 70)}")
     return 0

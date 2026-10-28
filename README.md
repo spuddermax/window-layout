@@ -9,12 +9,36 @@ nothing else had written the layout down.
 
 ## Using it
 
-After a crash, log back in and open your apps again. Then do either of
-these:
+After a crash, log back in and open your apps again. Then do one of these:
 
-- In the menu: **Restore Window Layout**. A notification says how many
-  windows went back and which apps weren't open yet.
-- In a terminal: `window-layout restore`.
+- **Double-click Window Layouts on the desktop** (it's also in the menu,
+  under Accessories). That opens the picker.
+- In the menu: **Restore Window Layout**. This puts windows back in one
+  click, with no picker, and a notification says how it went.
+- In a terminal: `window-layout restore`, or `window-layouts` for the
+  picker.
+
+### The picker
+
+![The picker](docs/picker.png)
+
+- **Left:** every snapshot on file, grouped by session: *This session*,
+  *Previous session* (the one a crash or logout ended), then *Earlier
+  session*. It opens with the previous session's last snapshot selected,
+  which is the layout you lost.
+- **Preview:** the chosen snapshot drawn to scale on the monitors it was
+  taken on, each app in its own colour. Use **Workspace** to see one
+  workspace at a time. Solid boxes are windows that are open now; dashed
+  boxes are apps that aren't open. Select a row to outline that window.
+- **List:** every window in the snapshot. Ticked windows are open now and
+  will be moved; untick one to leave it where it is. Rows for apps that
+  aren't open are greyed out.
+- **Restore N windows** moves the ticked windows. The picker stays open, and
+  the list updates every few seconds while it's open. Open a missing app
+  and it becomes tickable, then press Restore again.
+- The **camera button** saves the layout as it is right now.
+
+Opening the picker a second time brings the open one to the front.
 
 Windows that weren't open yet can be placed later: open them and restore
 again. Running it twice is harmless.
@@ -48,7 +72,9 @@ reopen.
 - **The snapshot.** `window-layout-snapshot.timer` (a systemd user timer)
   runs `window-layout snapshot` every two minutes. That reads `wmctrl -lGpx`
   and `xprop`, skips panels and the desktop, and writes a JSON file to
-  `~/.local/state/window-layout/snapshots/` only when the layout changed. It
+  `~/.local/state/window-layout/snapshots/` only when the layout changed.
+  A changed title alone doesn't count: a busy terminal's title has a
+  spinner in it, and a browser's title is its current tab. It
   exits quietly when there is no X display (during login, logout or a
   crash).
 - **Sessions.** Each snapshot records its X session: the boot id plus the X
@@ -75,9 +101,12 @@ ones, and `restore <name>` picks one.
 | What | Where |
 |---|---|
 | The tool (stdlib Python, needs `wmctrl`, `xprop`, `xdotool`) | `window_layout.py`, symlinked as `~/.local/bin/window-layout` |
-| Tests | `test_window_layout.py`, run with `python3 -m unittest -v` here. The live tests open xmessage windows on `$DISPLAY`. |
+| The picker (GTK 3) | `window_layout_gui.py`, symlinked as `~/.local/bin/window-layouts` |
+| Tests | `test_window_layout.py` and `test_window_layout_gui.py`, run with `python3 -m unittest -v` here. The live tests open xmessage windows on `$DISPLAY`, and the picker tests click the real Restore button. |
+| Icon | `window-layout.svg`, linked into `~/.local/share/icons/hicolor/scalable/apps/` |
+| Desktop icon | `~/Desktop/window-layouts.desktop`, executable and marked trusted, so Caja runs it without asking |
 | Timer and service | `~/.config/systemd/user/window-layout-snapshot.{timer,service}` |
-| Menu entry | `~/.local/share/applications/window-layout-restore.desktop` |
+| Menu entries | `~/.local/share/applications/window-layouts.desktop` (picker), `window-layout-restore.desktop` (one-click restore) |
 | Snapshots | `~/.local/state/window-layout/snapshots/` |
 
 To check that it's running:
@@ -93,4 +122,4 @@ To remove it:
 systemctl --user disable --now window-layout-snapshot.timer
 ```
 
-Then delete the files in the table above.
+Then delete the files in the table above, and the desktop icon.

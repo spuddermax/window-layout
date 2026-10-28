@@ -147,6 +147,8 @@ class Storage(unittest.TestCase):
         again = win("t.T", "a")
         again.id, again.pid = "0x9", 99
         self.assertIsNone(self._save([again], minutes=2))
+        #  Nor is a title that changed (a spinner, a browser tab).
+        self.assertIsNone(self._save([win("t.T", "◐ a")], minutes=3))
         self.assertIsNotNone(self._save([win("t.T", "a", x=5)], minutes=4))
         self.assertEqual(len(wl.snapshots(self.dir)), 2)
 
@@ -158,10 +160,10 @@ class Storage(unittest.TestCase):
         self.assertIsNone(self._save([]))
 
     def test_previous_is_the_last_snapshot_of_another_session(self):
-        self._save([win("t.T", "old")], "s1", 0)
-        self._save([win("t.T", "lost")], "s1", 2)        # the crash took this
-        self._save([win("t.T", "fresh")], "s2", 4)       # after logging back in
-        self._save([win("t.T", "fresher")], "s2", 6)
+        self._save([win("t.T", "old", x=1)], "s1", 0)
+        self._save([win("t.T", "lost", x=2)], "s1", 2)   # the crash took this
+        self._save([win("t.T", "fresh", x=3)], "s2", 4)  # after logging back in
+        self._save([win("t.T", "fresher", x=4)], "s2", 6)
         every = wl.snapshots(self.dir)
         self.assertEqual(wl.pick(every, "s2", "previous")["windows"][0].title,
                          "lost")
@@ -173,9 +175,9 @@ class Storage(unittest.TestCase):
         self.assertIsNone(wl.pick(wl.snapshots(self.dir)[2:], "s2", "previous"))
 
     def test_prune_keeps_the_last_of_each_recent_session(self):
-        self._save([win("t.T", "a")], "s1", 0)
-        self._save([win("t.T", "b")], "s1", 1)           # last of s1
-        self._save([win("t.T", "c")], "s2", 2)
+        self._save([win("t.T", "a", x=1)], "s1", 0)
+        self._save([win("t.T", "b", x=2)], "s1", 1)      # last of s1
+        self._save([win("t.T", "c", x=3)], "s2", 2)
         removed = wl.prune(self.dir, now=self.t0 + timedelta(days=30))
         left = [s["windows"][0].title for s in wl.snapshots(self.dir)]
         self.assertEqual(left, ["b", "c"])
@@ -183,7 +185,7 @@ class Storage(unittest.TestCase):
 
     def test_prune_keeps_everything_recent(self):
         for n in range(5):
-            self._save([win("t.T", str(n))], "s1", n)
+            self._save([win("t.T", str(n), x=n)], "s1", n)
         self.assertEqual(wl.prune(self.dir, now=self.t0 + timedelta(days=1)), [])
 
     def test_a_corrupt_snapshot_is_skipped(self):

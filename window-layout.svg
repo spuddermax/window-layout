@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b6fb6"/>
+      <stop offset="1" stop-color="#24497f"/>
+    </linearGradient>
+  </defs>
+  <!-- the screen, on a stand -->
+  <rect x="54" y="102" width="20" height="10" fill="#5a6270"/>
+  <rect x="40" y="110" width="48" height="7" rx="3.5" fill="#7a8392"/>
+  <rect x="6" y="10" width="116" height="92" rx="10" fill="url(#bg)" stroke="#1a355d" stroke-width="2"/>
+  <!-- three windows, laid out: shadow, body, coloured title bar -->
+  <g fill="#000" fill-opacity="0.28">
+    <rect x="17" y="22" width="52" height="38" rx="3"/>
+    <rect x="73" y="22" width="40" height="72" rx="3"/>
+    <rect x="17" y="64" width="52" height="30" rx="3"/>
+  </g>
+  <g fill="#e8eef7">
+    <rect x="16" y="20" width="52" height="38" rx="3"/>
+    <rect x="72" y="20" width="40" height="72" rx="3"/>
+    <rect x="16" y="62" width="52" height="30" rx="3"/>
+  </g>
+  <path d="M16 28 v-5 a3 3 0 0 1 3 -3 h46 a3 3 0 0 1 3 3 v5 z" fill="#f2a541"/>
+  <path d="M72 28 v-5 a3 3 0 0 1 3 -3 h34 a3 3 0 0 1 3 3 v5 z" fill="#6cc551"/>
+  <path d="M16 70 v-5 a3 3 0 0 1 3 -3 h46 a3 3 0 0 1 3 3 v5 z" fill="#e05d6f"/>
+  <!-- the "put back" arrow: three quarters of a turn, anticlockwise -->
+  <g transform="translate(94 94)">
+    <circle r="26" fill="#ffffff" stroke="#1a355d" stroke-width="2.5"/>
+    <path d="M 0 -13 A 13 13 0 1 0 13 0" fill="none" stroke="#2e6bc4" stroke-width="5.5" stroke-linecap="round"/>
+    <path d="M -1 -21 L 9 -13 L -1 -5 Z" fill="#2e6bc4" stroke="#2e6bc4" stroke-width="2" stroke-linejoin="round"/>
+  </g>
+</svg>
