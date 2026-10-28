@@ -1,0 +1,11 @@
+[Unit]
+Description=Snapshot the desktop window layout every two minutes
+Documentation=file:///home/matthew/projects/window-layout/README.md
+
+[Timer]
+OnStartupSec=60
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

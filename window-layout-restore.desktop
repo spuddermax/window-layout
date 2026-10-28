@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Restore Window Layout
+Comment=Put open windows back where they were before the last crash or logout
+Exec=/home/matthew/projects/window-layout/window_layout.py restore --notify
+Icon=preferences-system-windows
+Terminal=false
+Categories=Utility;System;

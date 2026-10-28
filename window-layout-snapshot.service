@@ -1,0 +1,9 @@
+[Unit]
+Description=Snapshot the desktop window layout
+Documentation=file:///home/matthew/projects/window-layout/README.md
+
+[Service]
+Type=oneshot
+ExecStart=/home/matthew/projects/window-layout/window_layout.py snapshot
+Nice=10
+IOSchedulingClass=idle
