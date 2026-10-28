@@ -7,6 +7,8 @@
                                     the end of the previous X session
     window-layout restore --dry-run say what it would do, move nothing
     window-layout list              the sessions and snapshots on file
+    window-layout delete NAME...    delete snapshots (-s: their whole
+                                    sessions); undelete brings them back
 
 Why: on 2026-10-27 the X session died under memory pressure and the layout
 of a dozen windows went with it -- MATE's session autosave was off and
@@ -57,6 +59,10 @@ KEEP_DAYS = 14
 #: Touched on every snapshot run, saved or not: a layout that hasn't
 #: changed since last night is current, not stale, and this says so.
 CHECKED = ".checked"
+#: Deleted snapshots wait here, inside the snapshot folder, to be undone.
+DELETED = ".deleted"
+#: How long a deleted snapshot can be brought back before prune drops it.
+UNDO_DAYS = 1
 #: How often the timer runs; a stamp much older than this means it stopped.
 EVERY_S = 120
 #: The last snapshot of each of this many sessions is kept past KEEP_DAYS.
@@ -248,16 +254,17 @@ def snapshots(folder: Path | None = None) -> list[dict]:
 
 def save(windows: list[Window], monitors: list[Monitor], session: str,
          folder: Path | None = None,
-         now: datetime | None = None) -> Path | None:
+         now: datetime | None = None, force: bool = False) -> Path | None:
     """Write a snapshot if the layout differs from the last one of this
-    session; return its path, or None when nothing changed (or there is
-    nothing to save)."""
+    session (or `force`); return its path, or None when nothing changed
+    (or there is nothing to save)."""
     if not windows:
         return None
     folder = folder or SNAPSHOTS
     folder.mkdir(parents=True, exist_ok=True)
     same_session = [s for s in snapshots(folder) if s["session"] == session]
-    if same_session and _layout(same_session[-1]["windows"]) == _layout(windows):
+    if not force and same_session and \
+            _layout(same_session[-1]["windows"]) == _layout(windows):
         return None
     now = now or datetime.now()
     path = folder / f"{now:%Y%m%d-%H%M%S}.json"
@@ -272,10 +279,60 @@ def save(windows: list[Window], monitors: list[Monitor], session: str,
     return path
 
 
-def mark_checked(folder: Path | None = None) -> None:
+def mark_checked(folder: Path | None = None, session: str = "",
+                 windows: list[Window] | None = None) -> None:
+    """Stamp a check, with the layout it saw: a layout already seen isn't
+    saved again, even if its snapshot has since been deleted."""
     folder = folder or SNAPSHOTS
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / CHECKED).touch()
+    (folder / CHECKED).write_text(json.dumps(
+        {"session": session, "layout": _layout(windows or [])}))
+
+
+def seen_last(session: str, windows: list[Window],
+              folder: Path | None = None) -> bool:
+    """Whether the last check saw this same layout in this session."""
+    try:
+        last = json.loads(((folder or SNAPSHOTS) / CHECKED).read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(last, dict) and last.get("session") == session and \
+        last.get("layout") == json.loads(json.dumps(_layout(windows)))
+
+
+def delete(paths: list[Path], folder: Path | None = None) -> list[Path]:
+    """Move snapshots into the undo folder; returns where each one went,
+    for `undelete`.  After UNDO_DAYS, prune deletes them for good."""
+    trash = (folder or SNAPSHOTS) / DELETED
+    trash.mkdir(parents=True, exist_ok=True)
+    moved = []
+    for path in paths:
+        to = trash / path.name
+        try:
+            path.replace(to)
+        except FileNotFoundError:
+            continue
+        os.utime(to)                   # the undo clock starts now
+        moved.append(to)
+    return moved
+
+
+def undelete(moved: list[Path] | None = None,
+             folder: Path | None = None) -> list[Path]:
+    """Put deleted snapshots back: `moved` (from `delete`), else every one
+    still in the undo folder.  Returns the restored paths."""
+    folder = folder or SNAPSHOTS
+    if moved is None:
+        moved = sorted((folder / DELETED).glob("*.json"))
+    back = []
+    for path in moved:
+        to = folder / path.name
+        try:
+            path.replace(to)
+        except FileNotFoundError:
+            continue
+        back.append(to)
+    return back
 
 
 def last_checked(folder: Path | None = None) -> datetime | None:
@@ -345,6 +402,11 @@ def prune(folder: Path | None = None,
         if snap["path"] not in keep and now - taken > timedelta(days=KEEP_DAYS):
             snap["path"].unlink(missing_ok=True)
             removed.append(snap["path"])
+    for path in (folder / DELETED).glob("*.json"):
+        if now - datetime.fromtimestamp(path.stat().st_mtime) > \
+                timedelta(days=UNDO_DAYS):
+            path.unlink(missing_ok=True)
+            removed.append(path)
     return removed
 
 
@@ -507,8 +569,13 @@ def cmd_snapshot(args) -> int:
         if args.verbose:
             print("no X display to read; skipped")
         return 0
-    path = save(windows, read_monitors(), session_key())
-    mark_checked()
+    session = session_key()
+    force = getattr(args, "force", False)
+    #  Seen on the last check: unchanged, even if that snapshot was deleted
+    #  since -- a deleted layout stays deleted until a window moves.
+    path = None if not force and seen_last(session, windows) else \
+        save(windows, read_monitors(), session, force=force)
+    mark_checked(session=session, windows=windows)
     prune()
     if args.verbose:
         print(f"saved {path}" if path else "unchanged")
@@ -598,12 +665,41 @@ def cmd_list(args) -> int:
     return 0
 
 
+def cmd_delete(args) -> int:
+    every = snapshots()
+    doomed: list[Path] = []
+    for which in args.which:
+        snap = pick(every, session_key(), which)
+        if snap is None or snap["path"].parent != SNAPSHOTS:
+            print(f"window-layout: no snapshot {which!r}", file=sys.stderr)
+            return 1
+        doomed += [s["path"] for s in every
+                   if (s["session"] == snap["session"] if args.session
+                       else s["path"] == snap["path"])]
+    doomed = sorted(set(doomed))
+    moved = delete(doomed)
+    print(f"deleted {len(moved)} snapshot{'s' * (len(moved) != 1)}: "
+          f"{_short(', '.join(p.stem for p in moved), 70)}")
+    print(f"`window-layout undelete` brings {'them' if len(moved) > 1 else 'it'}"
+          f" back for the next {UNDO_DAYS * 24} hours.")
+    return 0
+
+
+def cmd_undelete(args) -> int:
+    back = undelete()
+    print(f"brought back {len(back)} snapshot{'s' * (len(back) != 1)}"
+          + (f": {_short(', '.join(p.stem for p in back), 70)}" if back else ""))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="window-layout", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("snapshot", help="record the layout if it changed")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("-f", "--force", action="store_true",
+                   help="save even if nothing changed")
     p.set_defaults(func=cmd_snapshot)
     p = sub.add_parser("restore", help="put windows back")
     p.add_argument("which", nargs="?", default="previous",
@@ -619,6 +715,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--last", type=int, default=3,
                    help="snapshots shown per session (default 3)")
     p.set_defaults(func=cmd_list)
+    p = sub.add_parser("delete", help="delete snapshots (undoable for a day)")
+    p.add_argument("which", nargs="+",
+                   help="snapshot names (20261027-194300), previous or latest")
+    p.add_argument("-s", "--session", action="store_true",
+                   help="delete every snapshot of the named snapshots' sessions")
+    p.set_defaults(func=cmd_delete)
+    p = sub.add_parser("undelete", help="bring back deleted snapshots")
+    p.set_defaults(func=cmd_undelete)
     args = parser.parse_args(argv)
     for tool in ("wmctrl", "xprop"):
         if not shutil.which(tool):

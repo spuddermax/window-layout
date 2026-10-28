@@ -36,7 +36,14 @@ After a crash, log back in and open your apps again. Then do one of these:
 - **Restore N windows** moves the ticked windows. The picker stays open, and
   the list updates every few seconds while it's open. Open a missing app
   and it becomes tickable, then press Restore again.
-- The **camera button** saves the layout as it is right now.
+- The **camera button** saves the layout as it is right now, even if
+  nothing has moved since the last snapshot.
+- **Deleting:** select a snapshot and press the **trash button** or
+  **Delete**, or right-click it. Select a session's heading to delete the
+  whole session. An **Undo** bar appears at the bottom. Deleted snapshots
+  can be brought back for a day (`window-layout undelete`), then they're
+  gone for good. A deleted layout isn't saved again just because it is
+  still on screen; the next snapshot comes when a window moves.
 - **Under the title** it says when the desktop was last checked, e.g.
   *Checked just now; no window has moved since yesterday 23:03*. A
   snapshot is only saved when a window moves, so a newest snapshot from
@@ -54,7 +61,11 @@ window-layout restore --dry-run  # say what would move, move nothing
 window-layout restore latest     # the newest snapshot, this session included
 window-layout restore 20261027-194300   # a particular snapshot
 window-layout list               # sessions and their snapshots
-window-layout snapshot -v        # take one now
+window-layout snapshot -v        # take one now (if anything changed)
+window-layout snapshot --force   # take one now, changed or not
+window-layout delete 20261027-225125            # delete a snapshot
+window-layout delete --session 20261027-225125  # ...or its whole session
+window-layout undelete           # bring back what was deleted in the last day
 ```
 
 ## What it puts back
@@ -89,7 +100,11 @@ reopen.
   session other than this one, which is the layout that was lost. Snapshots
   taken after you log back in can't hide it.
 - **Pruning.** Snapshots are kept 14 days. The last snapshot of each of the
-  five most recent sessions is kept regardless of age.
+  five most recent sessions is kept regardless of age. Deleted snapshots
+  wait in `snapshots/.deleted/` for a day, for undo, then are removed.
+- **Deleted stays deleted.** `.checked` records the layout the last run
+  saw, so a run that sees the same layout saves nothing, even if its
+  snapshot was deleted in between.
 - **Marco's offset.** Marco does not hand back the coordinates it was given:
   a window set to (300, 200) can report (312, 270), by an offset that varies
   from window to window. So `restore` moves each window, reads where it

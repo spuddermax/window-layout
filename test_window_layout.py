@@ -123,6 +123,77 @@ class Screens(unittest.TestCase):
                          (0, 0, 1920, 1080))
 
 
+class Deleting(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        patch = mock.patch.object(wl, "SNAPSHOTS", self.dir)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.t0 = datetime(2026, 10, 27, 19, 0, 0)
+        self.a = wl.save([win("t.T", "a", x=1)], [], "s1", now=self.t0)
+        self.b = wl.save([win("t.T", "a", x=2)], [], "s1",
+                         now=self.t0 + timedelta(minutes=2))
+        self.c = wl.save([win("t.T", "a", x=3)], [], "s2",
+                         now=self.t0 + timedelta(minutes=4))
+
+    def names(self):
+        return [s["path"].name for s in wl.snapshots()]
+
+    def test_delete_and_undo(self):
+        moved = wl.delete([self.b])
+        self.assertEqual(self.names(), [self.a.name, self.c.name])
+        self.assertEqual(wl.undelete(moved), [self.b])
+        self.assertEqual(self.names(), [self.a.name, self.b.name, self.c.name])
+
+    def test_deleting_what_is_already_gone_is_harmless(self):
+        wl.delete([self.b])
+        self.assertEqual(wl.delete([self.b]), [])
+
+    def test_deleted_snapshots_are_dropped_for_good_after_a_day(self):
+        moved = wl.delete([self.a])
+        self.assertEqual(wl.prune(now=datetime.now() + timedelta(hours=1)), [])
+        self.assertEqual(wl.prune(now=datetime.now() + timedelta(days=2)), moved)
+        self.assertEqual(wl.undelete(moved), [])
+
+    def test_a_deleted_layout_is_not_saved_again_until_a_window_moves(self):
+        here = [win("t.T", "a", x=3)]
+        with mock.patch.object(wl, "read_windows", side_effect=lambda: list(here)), \
+             mock.patch.object(wl, "read_monitors", return_value=[]), \
+             mock.patch.object(wl, "session_key", return_value="s2"):
+            run = lambda **kw: wl.cmd_snapshot(SimpleNamespace(verbose=False, **kw))
+            run()                                   # sees c's layout
+            wl.delete([self.c])
+            run()
+            self.assertEqual(self.names(), [self.a.name, self.b.name])
+            here[0] = win("t.T", "a", x=9)          # a window moves
+            run()
+            self.assertEqual(len(self.names()), 3)
+            #  The camera button: saved even though nothing moved.
+            time.sleep(1.1)                         # names are by the second
+            run(force=True)
+            self.assertEqual(len(self.names()), 4)
+
+    def test_cli_deletes_by_name_or_by_session(self):
+        with mock.patch.object(wl, "session_key", return_value="s2"), \
+             mock.patch("sys.stdout.write") as out:
+            self.assertEqual(wl.main(["delete", self.a.stem]), 0)
+            self.assertEqual(self.names(), [self.b.name, self.c.name])
+            text = "".join(c.args[0] for c in out.call_args_list)
+            self.assertIn("deleted 1 snapshot:", text)
+            self.assertIn("undelete", text)
+            wl.main(["undelete"])
+            self.assertEqual(len(self.names()), 3)
+            wl.main(["delete", "--session", self.b.stem])
+            self.assertEqual(self.names(), [self.c.name])
+
+    def test_cli_refuses_an_unknown_name(self):
+        with mock.patch("sys.stderr.write") as err:
+            self.assertEqual(wl.main(["delete", "20991231-000000"]), 1)
+        self.assertIn("no snapshot", "".join(c.args[0] for c in err.call_args_list))
+        self.assertEqual(len(self.names()), 3)
+
+
 class CheckedNote(unittest.TestCase):
     now = datetime(2026, 10, 28, 9, 11, 0)
 

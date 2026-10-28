@@ -9,6 +9,9 @@ now (ticked, and moved by Restore) or not open (with the command that ran
 it).  Untick a window to leave it where it is.  The list follows the
 desktop while the picker is open, so an app you open from here on joins
 the restore without reopening the picker.
+
+Snapshots can be deleted one at a time or a session at a time (the trash
+button, the Delete key, or a right-click), with Undo.
 """
 
 from __future__ import annotations
@@ -106,6 +109,10 @@ def session_groups(every: list[dict],
 
 def windows(n: int) -> str:
     return f"{n} window{'s' * (n != 1)}"
+
+
+def snapshots(n: int) -> str:
+    return f"{n} snapshot{'s' * (n != 1)}"
 
 
 def state_label(states: list[str]) -> str:
@@ -275,7 +282,7 @@ class Preview(Gtk.DrawingArea):
 # ---------------------------------------------------------------------------
 
 # Columns of the snapshot tree.
-S_LABEL, S_DETAIL, S_PATH, S_BOLD = range(4)
+S_LABEL, S_DETAIL, S_PATH, S_BOLD, S_SESSION = range(5)
 # Columns of the window list.
 W_TICK, W_CAN, W_ICON, W_APP, W_TITLE, W_WS, W_STATUS, W_INDEX, W_DIM = \
     range(9)
@@ -306,13 +313,19 @@ class Picker(Gtk.ApplicationWindow):
         snap_button.set_tooltip_text("Save the layout as it is now")
         snap_button.connect("clicked", self.on_snapshot_now)
         header.pack_start(snap_button)
+        self.delete_button = Gtk.Button.new_from_icon_name(
+            "user-trash-symbolic", Gtk.IconSize.BUTTON)
+        self.delete_button.connect("clicked", self.on_delete)
+        header.pack_start(self.delete_button)
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         paned.set_position(340)
-        self.add(paned)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.pack_start(paned, True, True, 0)
+        self.add(outer)
 
         # Left: sessions and their snapshots.
-        self.tree_store = Gtk.TreeStore(str, str, str, int)
+        self.tree_store = Gtk.TreeStore(str, str, str, int, str)
         self.tree = Gtk.TreeView(model=self.tree_store, headers_visible=False)
         cell = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
         col = Gtk.TreeViewColumn("Snapshot", cell, markup=S_LABEL)
@@ -322,6 +335,13 @@ class Picker(Gtk.ApplicationWindow):
         detail.set_property("foreground-rgba", Gdk.RGBA(0.6, 0.6, 0.6, 1))
         self.tree.append_column(Gtk.TreeViewColumn("", detail, text=S_DETAIL))
         self.tree.get_selection().connect("changed", self.on_snapshot_picked)
+        self.tree.connect("key-press-event", self.on_tree_key)
+        self.tree.connect("button-press-event", self.on_tree_click)
+        self.menu = Gtk.Menu()
+        self.menu_delete = Gtk.MenuItem(label="Delete")
+        self.menu_delete.connect("activate", self.on_delete)
+        self.menu.append(self.menu_delete)
+        self.menu.show_all()
         left = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         left.add(self.tree)
         paned.pack1(left, resize=False, shrink=False)
@@ -378,6 +398,17 @@ class Picker(Gtk.ApplicationWindow):
         self.status = Gtk.Label(xalign=0, wrap=True)
         right.pack_start(self.status, False, False, 0)
 
+        #  After a delete: what went, and Undo.
+        self.undo_bar = Gtk.InfoBar(show_close_button=True)
+        self.undo_label = Gtk.Label(xalign=0, wrap=True)
+        self.undo_bar.get_content_area().add(self.undo_label)
+        self.undo_bar.add_button("Undo", Gtk.ResponseType.REJECT)
+        self.undo_bar.connect("response", self.on_undo_bar)
+        self.undo_bar.set_no_show_all(True)
+        self.undo_bar.get_content_area().show_all()
+        self.deleted: list = []
+        outer.pack_start(self.undo_bar, False, False, 0)
+
         self.load()
         GLib.timeout_add_seconds(REFRESH_S, self.on_tick)
 
@@ -402,7 +433,7 @@ class Picker(Gtk.ApplicationWindow):
             parent = self.tree_store.append(None, [
                 f"<b>{name}</b>\n<span size='small' alpha='60%'>"
                 f"{GLib.markup_escape_text(span)}</span>",
-                f"{len(snaps)}", "", 1])
+                f"{len(snaps)}", "", 1, snaps[0]["session"]])
             for snap in snaps:
                 taken = datetime.fromisoformat(snap["taken"])
                 apps = ", ".join(sorted({wl.app_name(w)
@@ -410,10 +441,18 @@ class Picker(Gtk.ApplicationWindow):
                 row = self.tree_store.append(parent, [
                     f"{taken:%H:%M:%S}  <span size='small' alpha='60%'>"
                     f"{GLib.markup_escape_text(apps)}</span>",
-                    windows(len(snap["windows"])), str(snap["path"]), 0])
+                    windows(len(snap["windows"])), str(snap["path"]), 0,
+                    snap["session"]])
                 if str(snap["path"]) == want:
                     chosen = row
         if chosen is None:
+            self.snap = None
+            self.steps = []
+            self.list_store.clear()
+            self.fill_workspaces()
+            self.preview.show_snapshot(None, [])
+            self.status.set_text("")
+            self.update_delete()
             self.title_label.set_markup(
                 "<b>No snapshots yet.</b>  The timer saves one every two "
                 "minutes; the camera button saves one now.")
@@ -517,6 +556,7 @@ class Picker(Gtk.ApplicationWindow):
     # -- events ----------------------------------------------------------
 
     def on_snapshot_picked(self, selection):
+        self.update_delete()
         model, it = selection.get_selected()
         if it is None or not model[it][S_PATH]:
             return
@@ -566,8 +606,85 @@ class Picker(Gtk.ApplicationWindow):
         return True
 
     def on_snapshot_now(self, button):
-        wl.cmd_snapshot(type("Args", (), {"verbose": False})())
+        #  Asked for: saved even if nothing moved since the last one.
+        wl.cmd_snapshot(type("Args", (), {"verbose": False, "force": True})())
         self.load(select=str(self.snap["path"]) if self.snap else None)
+
+    # -- deleting --------------------------------------------------------
+
+    def doomed(self) -> tuple[list, str]:
+        """What Delete would delete, from the row selected: that snapshot,
+        or every snapshot of a session row.  Returns (snapshots, what)."""
+        model, it = self.tree.get_selection().get_selected()
+        if it is None:
+            return [], ""
+        row = model[it]
+        if row[S_PATH]:
+            snaps = [s for s in self.every if str(s["path"]) == row[S_PATH]]
+            if not snaps:
+                return [], ""
+            taken = datetime.fromisoformat(snaps[0]["taken"])
+            return snaps, f"the {taken:%H:%M:%S} snapshot"
+        snaps = [s for s in self.every if s["session"] == row[S_SESSION]]
+        name = next((n for n, _, group in
+                     session_groups(self.every, wl.session_key())
+                     if group[0]["session"] == row[S_SESSION]), "the session")
+        return snaps, f"{name.lower()}: {snapshots(len(snaps))}"
+
+    def update_delete(self):
+        snaps, what = self.doomed()
+        self.delete_button.set_sensitive(bool(snaps))
+        self.menu_delete.set_sensitive(bool(snaps))
+        self.delete_button.set_tooltip_text(
+            f"Delete {what}" if snaps else "Delete the selected snapshot or session")
+        self.menu_delete.set_label(
+            "Delete this snapshot" if what.startswith("the ") else
+            f"Delete this session ({snapshots(len(snaps))})")
+
+    def on_delete(self, *_):
+        snaps, what = self.doomed()
+        if not snaps:
+            return
+        gone = {str(s["path"]) for s in snaps}
+        #  Then select the next one down the list (an older snapshot), or
+        #  else the one above: the list doesn't jump to the top.
+        order = [str(s["path"]) for _, _, group in
+                 session_groups(self.every, wl.session_key()) for s in group]
+        first = min(order.index(g) for g in gone)
+        after = [o for o in order[first:] if o not in gone] + \
+            [o for o in reversed(order[:first]) if o not in gone]
+        keep = self.snap and str(self.snap["path"])
+        select = keep if keep and keep not in gone else \
+            (after[0] if after else None)
+        self.deleted = wl.delete([s["path"] for s in snaps])
+        self.load(select=select)
+        self.undo_label.set_text(f"Deleted {what}.")
+        self.undo_bar.set_message_type(Gtk.MessageType.INFO)
+        self.undo_bar.show()
+
+    def on_undo_bar(self, bar, response):
+        if response == Gtk.ResponseType.REJECT and self.deleted:
+            back = wl.undelete(self.deleted)
+            self.load(select=str(back[0]) if back else None)
+        self.deleted = []
+        bar.hide()
+
+    def on_tree_key(self, tree, event):
+        if event.keyval in (Gdk.KEY_Delete, Gdk.KEY_KP_Delete):
+            self.on_delete()
+            return True
+        return False
+
+    def on_tree_click(self, tree, event):
+        if event.type != Gdk.EventType.BUTTON_PRESS or event.button != 3:
+            return False
+        hit = tree.get_path_at_pos(int(event.x), int(event.y))
+        if hit is None:
+            return False
+        tree.get_selection().select_path(hit[0])
+        self.update_delete()
+        self.menu.popup_at_pointer(event)
+        return True
 
     def on_restore(self, button):
         ticked = [self.steps[row[W_INDEX]] for row in self.list_store

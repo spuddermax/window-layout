@@ -22,7 +22,7 @@ import window_layout as wl
 HAVE_X = bool(os.environ.get("DISPLAY")) and shutil.which("xmessage")
 if HAVE_X:
     import window_layout_gui as gui
-    from gi.repository import Gtk
+    from gi.repository import Gdk, Gtk
 
 
 def snap(session, taken, n=1):
@@ -258,6 +258,74 @@ class PickerLive(unittest.TestCase):
         self.assertEqual(picker.snap["path"], picked)
         groups = [row[gui.S_LABEL] for row in picker.tree_store]
         self.assertTrue(groups[0].startswith("<b>This session</b>"), groups)
+
+    def _three(self):
+        w = [wl.Window("0x1", 0, 1, 10, 10, 300, 200, "zz.Zz", "z")]
+        t = datetime(2026, 10, 27, 19, 0)
+        older = wl.save(w, [], "old-session", now=t - timedelta(days=1))
+        paths = [wl.save([wl.Window(**{**w[0].__dict__, "x": x})], [],
+                         "lost-session", now=t + timedelta(minutes=x))
+                 for x in (1, 2, 3)]
+        return older, paths
+
+    def _select(self, picker, path):
+        for top in picker.tree_store:
+            for row in top.iterchildren():
+                if row[gui.S_PATH] == str(path):
+                    picker.tree.expand_to_path(row.path)
+                    picker.tree.get_selection().select_path(row.path)
+                    return
+        self.fail(f"{path} not listed")
+
+    def test_delete_a_snapshot_selects_the_next_and_undo_brings_it_back(self):
+        older, (p1, p2, p3) = self._three()
+        picker = self._picker()
+        self._select(picker, p2)
+        self.assertIn("19:02:00", picker.delete_button.get_tooltip_text())
+        picker.delete_button.clicked()
+        self.assertFalse(p2.exists())
+        self.assertEqual(picker.snap["path"], p1)        # the next one down
+        self.assertTrue(picker.undo_bar.get_visible())
+        self.assertEqual(picker.undo_label.get_text(),
+                         "Deleted the 19:02:00 snapshot.")
+        picker.undo_bar.response(Gtk.ResponseType.REJECT)
+        self.assertTrue(p2.exists())
+        self.assertEqual(picker.snap["path"], p2)
+        self.assertFalse(picker.undo_bar.get_visible())
+
+    def test_delete_a_whole_session(self):
+        older, paths = self._three()
+        picker = self._picker()
+        top = next(r for r in picker.tree_store
+                   if r[gui.S_SESSION] == "lost-session")
+        picker.tree.get_selection().select_path(top.path)
+        self.assertEqual(picker.menu_delete.get_label(),
+                         "Delete this session (3 snapshots)")
+        picker.on_delete()
+        self.assertFalse(any(p.exists() for p in paths))
+        self.assertTrue(older.exists())
+        self.assertEqual(picker.snap["path"], older)
+        self.assertIn("3 snapshots", picker.undo_label.get_text())
+
+    def test_the_delete_key_deletes(self):
+        older, (p1, p2, p3) = self._three()
+        picker = self._picker()
+        self._select(picker, p3)
+        event = Gdk.Event.new(Gdk.EventType.KEY_PRESS)
+        event.keyval = Gdk.KEY_Delete
+        self.assertTrue(picker.on_tree_key(picker.tree, event))
+        self.assertFalse(p3.exists())
+
+    def test_deleting_everything_leaves_an_empty_picker(self):
+        older, paths = self._three()
+        picker = self._picker()
+        for _ in range(4):
+            self._select(picker, wl.snapshots()[0]["path"])
+            picker.on_delete()
+        self.assertEqual(wl.snapshots(), [])
+        self.assertIsNone(picker.snap)
+        self.assertIn("No snapshots yet", picker.title_label.get_text())
+        self.assertFalse(picker.delete_button.get_sensitive())
 
     def test_no_snapshots_says_so(self):
         picker = self._picker()
