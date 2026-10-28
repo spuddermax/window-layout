@@ -529,7 +529,8 @@ def cmd_list(args) -> int:
               f"{snaps[0]['taken']} .. {snaps[-1]['taken']}")
         for snap in snaps[-args.last:]:
             apps = sorted({app_name(w) for w in snap["windows"]})
-            print(f"  {snap['path'].stem}  {len(snap['windows']):>2} windows  "
+            n = len(snap["windows"])
+            print(f"  {snap['path'].stem}  {n:>2} window{'s' * (n != 1):<1}  "
                   f"{_short(', '.join(apps), 70)}")
     return 0
 
