@@ -54,6 +54,11 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME")
                  or Path.home() / ".local" / "state") / "window-layout"
 SNAPSHOTS = STATE_DIR / "snapshots"
 KEEP_DAYS = 14
+#: Touched on every snapshot run, saved or not: a layout that hasn't
+#: changed since last night is current, not stale, and this says so.
+CHECKED = ".checked"
+#: How often the timer runs; a stamp much older than this means it stopped.
+EVERY_S = 120
 #: The last snapshot of each of this many sessions is kept past KEEP_DAYS.
 KEEP_SESSIONS = 5
 #: Window types that are part of the desktop, not windows to put back.
@@ -267,6 +272,60 @@ def save(windows: list[Window], monitors: list[Monitor], session: str,
     return path
 
 
+def mark_checked(folder: Path | None = None) -> None:
+    folder = folder or SNAPSHOTS
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / CHECKED).touch()
+
+
+def last_checked(folder: Path | None = None) -> datetime | None:
+    """When the desktop was last read for a snapshot, or None if never."""
+    try:
+        return datetime.fromtimestamp(((folder or SNAPSHOTS) / CHECKED)
+                                      .stat().st_mtime)
+    except OSError:
+        return None
+
+
+def _when(t: datetime, now: datetime) -> str:
+    """09:10, yesterday 23:03, or Oct 25 23:03."""
+    days = (now.date() - t.date()).days
+    day = "" if days == 0 else "yesterday " if days == 1 else f"{t:%b %-d} "
+    return f"{day}{t:%H:%M}"
+
+
+def _ago(seconds: float) -> str:
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min ago"
+    return f"{int(seconds // 3600)} h ago"
+
+
+def checked_note(checked: datetime | None, newest: datetime | None,
+                 now: datetime | None = None) -> str:
+    """One line on whether snapshots are current.  `newest` is the newest
+    snapshot of this session.  A snapshot is only written when a window
+    moves, so an old newest snapshot with a fresh check is a layout that
+    hasn't changed -- not a timer that stopped."""
+    now = now or datetime.now()
+    if checked is None:
+        return ("Never checked: is window-layout-snapshot.timer running? "
+                "(systemctl --user status window-layout-snapshot.timer)")
+    age = (now - checked).total_seconds()
+    if age > 3 * EVERY_S:
+        return (f"Last checked {_when(checked, now)}, {_ago(age)}: the "
+                f"snapshot timer seems to have stopped "
+                f"(systemctl --user status window-layout-snapshot.timer)")
+    note = f"Checked {_ago(age)}"
+    if newest is None:
+        return note + "; nothing saved this session yet"
+    if (checked - newest).total_seconds() < 60:
+        return note + f"; saved then ({_when(newest, now)})"
+    return (note + f"; no window has moved since {_when(newest, now)}, "
+            f"the newest snapshot")
+
+
 def prune(folder: Path | None = None,
           now: datetime | None = None) -> list[Path]:
     """Drop snapshots older than KEEP_DAYS, except the last of each of the
@@ -449,6 +508,7 @@ def cmd_snapshot(args) -> int:
             print("no X display to read; skipped")
         return 0
     path = save(windows, read_monitors(), session_key())
+    mark_checked()
     prune()
     if args.verbose:
         print(f"saved {path}" if path else "unchanged")
@@ -519,6 +579,9 @@ def cmd_list(args) -> int:
         print(f"no snapshots in {SNAPSHOTS}")
         return 0
     here = session_key()
+    mine = [s for s in every if s["session"] == here]
+    print(checked_note(last_checked(), datetime.fromisoformat(
+        mine[-1]["taken"]) if mine else None) + ".")
     by_session: dict[str, list[dict]] = {}
     for snap in every:
         by_session.setdefault(snap["session"], []).append(snap)

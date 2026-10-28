@@ -123,6 +123,44 @@ class Screens(unittest.TestCase):
                          (0, 0, 1920, 1080))
 
 
+class CheckedNote(unittest.TestCase):
+    now = datetime(2026, 10, 28, 9, 11, 0)
+
+    def note(self, checked_ago, newest=None):
+        return wl.checked_note(
+            None if checked_ago is None else self.now - timedelta(seconds=checked_ago),
+            newest, self.now)
+
+    def test_an_old_snapshot_and_a_fresh_check_is_an_unchanged_layout(self):
+        self.assertEqual(
+            self.note(35, datetime(2026, 10, 27, 23, 3, 37)),
+            "Checked just now; no window has moved since yesterday 23:03, "
+            "the newest snapshot")
+
+    def test_saved_on_the_last_check(self):
+        checked = self.now - timedelta(seconds=150)
+        self.assertEqual(wl.checked_note(checked, checked, self.now),
+                         "Checked 2 min ago; saved then (09:08)")
+
+    def test_a_stale_check_is_a_stopped_timer(self):
+        text = self.note(3 * 3600, datetime(2026, 10, 25, 6, 0))
+        self.assertTrue(text.startswith("Last checked 06:11, 3 h ago: the "
+                                        "snapshot timer seems to have stopped"),
+                        text)
+        self.assertIn("systemctl --user status", text)
+
+    def test_never_checked(self):
+        self.assertIn("Never checked", self.note(None))
+
+    def test_nothing_saved_this_session(self):
+        self.assertEqual(self.note(10), "Checked just now; nothing saved this "
+                                        "session yet")
+
+    def test_older_days_name_the_date(self):
+        self.assertEqual(wl._when(datetime(2026, 10, 25, 6, 0), self.now),
+                         "Oct 25 06:00")
+
+
 class Storage(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
@@ -158,6 +196,24 @@ class Storage(unittest.TestCase):
 
     def test_an_empty_desktop_is_not_saved(self):
         self.assertIsNone(self._save([]))
+
+    def test_every_run_is_stamped_saved_or_not(self):
+        self.assertIsNone(wl.last_checked(self.dir))
+        with mock.patch.object(wl, "SNAPSHOTS", self.dir), \
+             mock.patch.object(wl, "read_windows", return_value=[win("t.T", "a")]), \
+             mock.patch.object(wl, "read_monitors", return_value=[]), \
+             mock.patch.object(wl, "session_key", return_value="s1"):
+            wl.cmd_snapshot(SimpleNamespace(verbose=False))
+            first = wl.last_checked(self.dir)
+            os.utime(self.dir / wl.CHECKED, (0, 0))
+            #  Unchanged: nothing new saved, but the check is recorded.
+            wl.cmd_snapshot(SimpleNamespace(verbose=False))
+        self.assertIsNotNone(first)
+        self.assertEqual(len(wl.snapshots(self.dir)), 1)
+        self.assertGreater(wl.last_checked(self.dir), datetime(2000, 1, 1))
+        #  The stamp is not a snapshot.
+        self.assertEqual([p.suffix for p in self.dir.iterdir()
+                          if p.name != wl.CHECKED], [".json"])
 
     def test_previous_is_the_last_snapshot_of_another_session(self):
         self._save([win("t.T", "old", x=1)], "s1", 0)

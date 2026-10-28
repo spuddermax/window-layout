@@ -37,6 +37,11 @@ After a crash, log back in and open your apps again. Then do one of these:
   the list updates every few seconds while it's open. Open a missing app
   and it becomes tickable, then press Restore again.
 - The **camera button** saves the layout as it is right now.
+- **Under the title** it says when the desktop was last checked, e.g.
+  *Checked just now; no window has moved since yesterday 23:03*. A
+  snapshot is only saved when a window moves, so a newest snapshot from
+  last night just means nothing has moved since. If the timer stops, this
+  line says so. New snapshots appear while the picker is open.
 
 Opening the picker a second time brings the open one to the front.
 
@@ -74,7 +79,9 @@ reopen.
   and `xprop`, skips panels and the desktop, and writes a JSON file to
   `~/.local/state/window-layout/snapshots/` only when the layout changed.
   A changed title alone doesn't count: a busy terminal's title has a
-  spinner in it, and a browser's title is its current tab. It
+  spinner in it, and a browser's title is its current tab. Every run
+  touches `snapshots/.checked`, saved or not, which is how the picker and
+  `window-layout list` tell "unchanged" from "stopped". It
   exits quietly when there is no X display (during login, logout or a
   crash).
 - **Sessions.** Each snapshot records its X session: the boot id plus the X
@@ -109,7 +116,8 @@ ones, and `restore <name>` picks one.
 | Menu entries | `~/.local/share/applications/window-layouts.desktop` (picker), `window-layout-restore.desktop` (one-click restore) |
 | Snapshots | `~/.local/state/window-layout/snapshots/` |
 
-To check that it's running:
+To check that it's running, `window-layout list` starts with when it last
+checked, or:
 
 ```
 systemctl --user list-timers window-layout-snapshot.timer

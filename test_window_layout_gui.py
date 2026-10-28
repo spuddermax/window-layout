@@ -241,6 +241,24 @@ class PickerLive(unittest.TestCase):
             picker.preview.queue_draw()
             self._pump(0.05)
 
+    def test_snapshots_saved_while_open_appear_and_the_pick_stays(self):
+        a = self._open(f"pk-n-{self.stamp}")
+        t = datetime(2026, 10, 27, 23, 3)
+        wl.save(self._ours(), [], "lost-session", now=t)
+        wl.mark_checked()
+        picker = self._picker()
+        picked = picker.snap["path"]
+        self.assertIn("Checked just now", picker.header.get_subtitle())
+        #  The timer saves one in this session while the picker is open.
+        wl._run("wmctrl", "-i", "-r", a, "-e", "0,200,200,300,200")
+        time.sleep(0.3)
+        wl.save(self._ours(), [], wl.session_key(), now=t + timedelta(hours=10))
+        picker.on_tick()
+        self.assertEqual(len(picker.every), 2)
+        self.assertEqual(picker.snap["path"], picked)
+        groups = [row[gui.S_LABEL] for row in picker.tree_store]
+        self.assertTrue(groups[0].startswith("<b>This session</b>"), groups)
+
     def test_no_snapshots_says_so(self):
         picker = self._picker()
         self.assertIn("No snapshots yet", picker.title_label.get_text())

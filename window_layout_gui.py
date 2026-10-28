@@ -294,9 +294,8 @@ class Picker(Gtk.ApplicationWindow):
         self.unticked: set[int] = set()
         self.busy = False
 
-        header = Gtk.HeaderBar(show_close_button=True,
-                               title="Window Layouts",
-                               subtitle="Pick a layout to put your windows back")
+        self.header = header = Gtk.HeaderBar(show_close_button=True,
+                                             title="Window Layouts")
         self.set_titlebar(header)
         self.restore_button = Gtk.Button(label="Restore")
         self.restore_button.get_style_context().add_class("suggested-action")
@@ -387,11 +386,16 @@ class Picker(Gtk.ApplicationWindow):
     def load(self, select: str | None = None):
         """(Re)read the snapshots and select one: `select` by path, else
         the one `restore` would use."""
+        self.seen = self.on_file()
         self.every = wl.snapshots()
         here = wl.session_key()
+        self.show_checked()
         default = wl.pick(self.every, here, "previous") or \
             (self.every[-1] if self.every else None)
-        want = select or (str(default["path"]) if default else None)
+        paths = {str(s["path"]) for s in self.every}
+        #  The one asked for, unless it has since been pruned.
+        want = select if select in paths else \
+            (str(default["path"]) if default else None)
         self.tree_store.clear()
         chosen = None
         for name, span, snaps in session_groups(self.every, here):
@@ -426,6 +430,19 @@ class Picker(Gtk.ApplicationWindow):
             top = self.tree_store.iter_next(top)
         self.tree.get_selection().select_iter(chosen)
         self.tree.scroll_to_cell(path, None, True, 0.3, 0)
+
+    @staticmethod
+    def on_file() -> list[str]:
+        return sorted(p.name for p in wl.SNAPSHOTS.glob("*.json"))
+
+    def show_checked(self):
+        """The subtitle: when the desktop was last read, so a layout that
+        hasn't changed since last night doesn't look like a stopped
+        timer."""
+        here = wl.session_key()
+        mine = [s for s in self.every if s["session"] == here]
+        newest = datetime.fromisoformat(mine[-1]["taken"]) if mine else None
+        self.header.set_subtitle(wl.checked_note(wl.last_checked(), newest))
 
     def replan(self):
         """Match the chosen snapshot against the windows open now."""
@@ -539,6 +556,12 @@ class Picker(Gtk.ApplicationWindow):
 
     def on_tick(self):
         if not self.busy and self.get_visible():
+            #  The timer saves while the picker is open: show new snapshots,
+            #  keeping the one picked.
+            if self.on_file() != self.seen:
+                self.load(select=str(self.snap["path"]) if self.snap else None)
+            else:
+                self.show_checked()
             self.replan()
         return True
 
