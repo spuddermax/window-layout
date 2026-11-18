@@ -96,10 +96,13 @@ SETTLE_S = 0.15
 OPEN_WAIT_S = 20
 #: ...and how long no new window must appear before a round is done.
 OPEN_QUIET_S = 3
-#: Terminals that take --working-directory: one reopened from a saved
-#: window titled `user@host: ~/projects/x` opens in ~/projects/x.
+#: Terminals that take --working-directory: one reopens in the folder its
+#: shell was in (see `tabs`), else the one in its `user@host: ~/x` title.
 TERMINALS = {"mate-terminal", "gnome-terminal", "xfce4-terminal", "tilix",
              "terminator"}
+#: ...and those that also take `--window --tab --tab`, each tab with its
+#: own --working-directory: a window of three tabs reopens as three tabs.
+TABBED = {"mate-terminal", "gnome-terminal", "xfce4-terminal"}
 
 
 @dataclass
@@ -119,6 +122,9 @@ class Window:
     #: it again.  (Older snapshots have only `command`, argv joined.)
     argv: list[str] = field(default_factory=list)
     cwd: str = ""
+    #: A terminal's tabs: the folder each one's shell was in (its `pwd`),
+    #: oldest tab first.  Empty for anything that isn't a terminal.
+    tabs: list[str] = field(default_factory=list)
 
     @property
     def rect(self) -> tuple[int, int, int, int]:
@@ -159,6 +165,19 @@ def parse_wmctrl(text: str) -> list[Window]:
         windows.append(Window(wid, int(desk), int(pid), int(x), int(y),
                               int(w), int(h), cls, title))
     return windows
+
+
+def _list_windows() -> list[Window]:
+    """`wmctrl -lGpx`, read again if it fails: it does when a window closes
+    while it's being listed.  With no X display it fails every time."""
+    for attempt in range(3):
+        try:
+            return parse_wmctrl(_run("wmctrl", "-lGpx"))
+        except subprocess.CalledProcessError:
+            if attempt == 2:
+                raise
+            time.sleep(0.1)
+    return []
 
 
 def parse_xprop(text: str) -> tuple[list[str], set[str]]:
@@ -229,9 +248,72 @@ def owner(pid: int, wm_class: str) -> int:
     return pid
 
 
+def _children(proc: Path = Path("/proc")) -> dict[int, list[int]]:
+    """Our processes by parent pid."""
+    kids: dict[int, list[int]] = {}
+    uid = os.getuid()
+    for d in proc.iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            if d.stat().st_uid != uid:
+                continue
+            #  The command name can hold spaces and parentheses: the
+            #  fields after the last ")" are fixed.
+            ppid = int((d / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        kids.setdefault(ppid, []).append(int(d.name))
+    return kids
+
+
+def _windowid(pid: int, proc: Path = Path("/proc")) -> int | None:
+    try:
+        env = (proc / str(pid) / "environ").read_bytes()
+    except OSError:
+        return None
+    for var in env.split(b"\0"):
+        if var.startswith(b"WINDOWID="):
+            try:
+                return int(var[9:])
+            except ValueError:
+                return None
+    return None
+
+
+def terminal_tabs(windows: list[Window],
+                  proc: Path = Path("/proc")) -> dict[str, list[str]]:
+    """Each terminal window's tabs, as the folder each tab's shell is in:
+    {window id: [folder, ...]}.  A terminal starts each tab's shell with
+    WINDOWID set to its window, in decimal; the shells are the terminal
+    process's own children (their children inherit WINDOWID too, so only
+    the direct children count) -- and only those reading from a tab's
+    pseudo-terminal, once per terminal: a helper the terminal spawned
+    isn't a tab."""
+    kids = _children(proc)
+    ours = {int(w.id, 16): w.id for w in windows}
+    tabs: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for pid in sorted({w.pid for w in windows}):
+        for child in sorted(kids.get(pid, [])):
+            wid = _windowid(child, proc)
+            if wid not in ours:
+                continue
+            try:
+                tty = os.readlink(proc / str(child) / "fd" / "0")
+                folder = os.readlink(proc / str(child) / "cwd")
+            except OSError:
+                continue
+            if not tty.startswith("/dev/pts/") or tty in seen:
+                continue
+            seen.add(tty)
+            tabs.setdefault(ours[wid], []).append(folder)
+    return tabs
+
+
 def read_windows() -> list[Window]:
     windows = []
-    for win in parse_wmctrl(_run("wmctrl", "-lGpx")):
+    for win in _list_windows():
         try:
             states, types = parse_xprop(_run(
                 "xprop", "-id", win.id, "_NET_WM_STATE", "_NET_WM_WINDOW_TYPE"))
@@ -245,6 +327,12 @@ def read_windows() -> list[Window]:
         win.command = " ".join(win.argv)
         win.cwd = _cwd(win.pid)
         windows.append(win)
+    try:
+        tabs = terminal_tabs(windows)
+    except OSError:
+        tabs = {}
+    for win in windows:
+        win.tabs = tabs.get(win.id, [])
     return windows
 
 
@@ -282,7 +370,8 @@ def _layout(windows: list[Window]) -> list[dict]:
     pids and titles, in a stable order.  Titles help match a window but are
     not where it is -- and a busy terminal's title has a spinner in it, a
     browser's is its tab, so counting them would save a "new" layout every
-    two minutes."""
+    two minutes.  A terminal's tabs' folders do count: a `cd` is saved, so
+    the last snapshot reopens each terminal where its shell last was."""
     return sorted(({k: v for k, v in asdict(w).items()
                     if k not in ("id", "pid", "title", "argv", "cwd")}
                    for w in windows),
@@ -600,12 +689,23 @@ def launch_argv(w: Window) -> list[str] | None:
     #  LibreOffice's launcher hands soffice.bin a pipe to its splash screen;
     #  run straight, that descriptor is not there.
     argv = [a for a in argv if not a.startswith("--splash-pipe=")]
-    if os.path.basename(exe) in TERMINALS and \
-            not any(a.startswith("--working-directory") for a in argv):
-        folder = terminal_dir(w.title)
-        if folder:
-            #  Right after the program: anything after `--` is the shell's.
-            argv.insert(1, f"--working-directory={folder}")
+    name = os.path.basename(exe)
+    if name not in TERMINALS or \
+            any(a.startswith("--working-directory") for a in argv):
+        return argv
+    #  Folders that are gone open in home instead.
+    tabs = [t if os.path.isdir(t) else str(Path.home()) for t in w.tabs]
+    if name in TABBED and len(argv) == 1 and len(tabs) > 1:
+        #  A plain terminal of several tabs: the same tabs, each in its
+        #  folder.  (One started with a command of its own keeps it.)
+        out = [exe, "--window", f"--working-directory={tabs[0]}"]
+        for t in tabs[1:]:
+            out += ["--tab", f"--working-directory={t}"]
+        return out
+    folder = tabs[0] if tabs else terminal_dir(w.title)
+    if folder:
+        #  Right after the program: anything after `--` is the shell's.
+        argv.insert(1, f"--working-directory={folder}")
     return argv
 
 
@@ -715,7 +815,7 @@ def reopen(missing: list[Window], read=None, timeout: float = OPEN_WAIT_S,
 
 
 def _geometry(wid: str) -> tuple[int, int, int, int] | None:
-    for win in parse_wmctrl(_run("wmctrl", "-lGpx")):
+    for win in _list_windows():
         if win.id == wid:
             return win.rect
     return None

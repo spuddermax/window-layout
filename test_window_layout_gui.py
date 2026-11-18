@@ -99,6 +99,15 @@ class Helpers(unittest.TestCase):
         self.assertEqual(gui.state_label(["sticky", "above"]),
                          "on every workspace, always on top")
 
+    def test_where_a_terminals_tabs_are(self):
+        home = str(Path.home())
+        self.assertEqual(gui.tabs_label([]), "")
+        self.assertEqual(gui.tabs_label([home]), "~")
+        self.assertEqual(gui.tabs_label([home + "/projects/x"]), "~/projects/x")
+        self.assertEqual(gui.tabs_label(["/tmp", "/usr"]), "/tmp + 1 tab")
+        self.assertEqual(gui.tabs_label(["/tmp", "/a", "/b"]), "/tmp + 2 tabs")
+        self.assertEqual(gui.tabs_label([home + "x"]), home + "x")
+
     def test_counts_read_right(self):
         self.assertEqual(gui.windows(1), "1 window")
         self.assertEqual(gui.windows(0), "0 windows")
@@ -277,14 +286,19 @@ class PickerLive(unittest.TestCase):
     def test_workspace_buttons_filter_the_preview(self):
         a = self._open(f"pk-w-{self.stamp}")
         win = next(w for w in self._ours() if w.id == a)
-        other = wl.Window(**{**win.__dict__, "desktop": 2, "id": "0xdead",
-                             "title": "elsewhere", "wm_class": "z.Z"})
+        #  The next workspace after the one the window opened on, whichever
+        #  that is (it's the workspace the person is on).
+        elsewhere = win.desktop + 1
+        other = wl.Window(**{**win.__dict__, "desktop": elsewhere,
+                             "id": "0xdead", "title": "elsewhere",
+                             "wm_class": "z.Z"})
         wl.save([win, other], wl.read_monitors(), "lost-session")
         picker = self._picker()
         labels = [b.get_label() for b in picker.workspaces.get_children()]
-        self.assertEqual(labels, ["All", str(win.desktop + 1), "3"])
+        self.assertEqual(labels, ["All", str(win.desktop + 1),
+                                  str(elsewhere + 1)])
         picker.workspaces.get_children()[2].set_active(True)
-        self.assertEqual(picker.preview.workspace, 2)
+        self.assertEqual(picker.preview.workspace, elsewhere)
         #  And the preview draws without error at every workspace.
         for button in picker.workspaces.get_children():
             button.set_active(True)

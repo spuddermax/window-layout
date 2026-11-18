@@ -428,6 +428,88 @@ class Reopening(unittest.TestCase):
         self.assertEqual((failed, started), ([a], []))
 
 
+class TerminalTabs(unittest.TestCase):
+    """Which folder each terminal tab's shell is in, from a fake /proc."""
+
+    def setUp(self):
+        self.proc = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.proc)
+
+    def process(self, pid, ppid, windowid=None, cwd="/", tty="/dev/pts/0",
+                comm="bash"):
+        d = self.proc / str(pid)
+        (d / "fd").mkdir(parents=True)
+        (d / "stat").write_text(f"{pid} ({comm}) S {ppid} 1 1 0 -1\n")
+        env = b"HOME=/h\0" + (f"WINDOWID={windowid}\0".encode()
+                              if windowid is not None else b"")
+        (d / "environ").write_bytes(env)
+        (d / "cwd").symlink_to(cwd)
+        (d / "fd" / "0").symlink_to(tty)
+
+    def test_shells_are_found_by_windowid_tab_by_tab(self):
+        a, b = 0x5a00006, 0x5a0891f
+        self.process(100, 1, comm="mate-terminal")
+        self.process(101, 100, a, "/home/u/one", "/dev/pts/0")
+        self.process(102, 100, b, "/home/u/two", "/dev/pts/1")
+        self.process(103, 100, a, "/tmp", "/dev/pts/2")       # a's 2nd tab
+        #  Not tabs: what a shell runs inherits WINDOWID; a helper the
+        #  terminal spawned has no pty; a pty counted once.
+        self.process(104, 101, a, "/elsewhere", "/dev/pts/0")
+        self.process(105, 100, a, "/helper", "/dev/null")
+        self.process(106, 100, a, "/dup", "/dev/pts/2")
+        self.process(107, 1, a, "/stranger", "/dev/pts/9")
+        wins = [wl.Window(hex(a), 0, 100, 0, 0, 1, 1, "t.T", ""),
+                wl.Window(hex(b), 0, 100, 0, 0, 1, 1, "t.T", ""),
+                wl.Window("0x99", 0, 200, 0, 0, 1, 1, "x.X", "")]
+        got = wl.terminal_tabs(wins, self.proc)
+        self.assertEqual(got, {hex(a): ["/home/u/one", "/tmp"],
+                               hex(b): ["/home/u/two"]})
+
+    def test_a_command_name_with_spaces_and_parens(self):
+        self.process(100, 1, comm="odd) name (x")
+        self.process(101, 100, 0x10, "/srv", comm="sh) (y")
+        got = wl.terminal_tabs(
+            [wl.Window("0x10", 0, 100, 0, 0, 1, 1, "t.T", "")], self.proc)
+        self.assertEqual(got, {"0x10": ["/srv"]})
+
+    def term(self, tabs, argv=("/bin/sh",), title=""):
+        return wl.Window("0x1", 0, 1, 0, 0, 1, 1, "t.T", title,
+                         argv=list(argv), tabs=list(tabs))
+
+    def test_tabs_reopen_as_tabs_each_in_its_folder(self):
+        with mock.patch.object(wl, "TERMINALS", {"sh"}), \
+             mock.patch.object(wl, "TABBED", {"sh"}):
+            self.assertEqual(
+                wl.launch_argv(self.term(["/tmp", "/usr"])),
+                ["/bin/sh", "--window", "--working-directory=/tmp",
+                 "--tab", "--working-directory=/usr"])
+            #  One tab: the shell's folder beats the title's.
+            self.assertEqual(
+                wl.launch_argv(self.term(["/usr"], title="me@box: /tmp")),
+                ["/bin/sh", "--working-directory=/usr"])
+            #  A folder that's gone: home.
+            self.assertEqual(
+                wl.launch_argv(self.term(["/no/such/folder"])),
+                ["/bin/sh", f"--working-directory={Path.home()}"])
+            #  No tabs recorded (an older snapshot): the title.
+            self.assertEqual(
+                wl.launch_argv(self.term([], title="me@box: /tmp")),
+                ["/bin/sh", "--working-directory=/tmp"])
+            #  Started with a command of its own: that stays, first tab only.
+            self.assertEqual(
+                wl.launch_argv(self.term(["/tmp", "/usr"],
+                                         argv=("/bin/sh", "--", "top"))),
+                ["/bin/sh", "--working-directory=/tmp", "--", "top"])
+        with mock.patch.object(wl, "TERMINALS", {"sh"}), \
+             mock.patch.object(wl, "TABBED", set()):
+            self.assertEqual(wl.launch_argv(self.term(["/tmp", "/usr"])),
+                             ["/bin/sh", "--working-directory=/tmp"])
+
+    def test_a_cd_is_a_new_layout(self):
+        a, b = self.term(["/tmp"]), self.term(["/usr"])
+        self.assertNotEqual(wl._layout([a]), wl._layout([b]))
+
+
 class Restore(unittest.TestCase):
     """cmd_restore's report, with the desktop faked."""
 
@@ -498,6 +580,16 @@ class Restore(unittest.TestCase):
              mock.patch.object(wl, "save") as save:
             wl.cmd_snapshot(SimpleNamespace(verbose=False))
         self.assertEqual([w.title for w in save.call_args.args[0]], ["a"])
+
+    def test_a_window_closing_mid_list_is_read_again(self):
+        gone = subprocess.CalledProcessError(1, ["wmctrl"])
+        with mock.patch.object(wl, "_run", side_effect=[gone, WMCTRL]), \
+             mock.patch.object(wl.time, "sleep"):
+            self.assertEqual(len(wl._list_windows()), 4)
+        with mock.patch.object(wl, "_run", side_effect=gone), \
+             mock.patch.object(wl.time, "sleep"):
+            with self.assertRaises(subprocess.CalledProcessError):
+                wl._list_windows()
 
     def test_a_snapshot_with_no_x_display_is_skipped_quietly(self):
         gone = subprocess.CalledProcessError(1, ["wmctrl"], stderr="Cannot open display")
@@ -660,6 +752,47 @@ class Live(unittest.TestCase):
         wl.place(step.now.id, step.saved, step.rect, wl.desktop_count())
         time.sleep(0.4)
         self.assertEqual(self._here(back[0].id).rect, saved[0].rect)
+
+    @unittest.skipUnless(os.environ.get("WINDOWID"), "not run in a terminal")
+    def test_the_terminal_running_this_knows_its_tabs(self):
+        wid = hex(int(os.environ["WINDOWID"]))
+        mine = [w for w in wl.read_windows() if int(w.id, 16) == int(wid, 16)]
+        if not mine:
+            self.skipTest("terminal not on this display")
+        self.assertTrue(mine[0].tabs)
+        self.assertTrue(all(os.path.isdir(t) for t in mine[0].tabs))
+
+    @unittest.skipUnless(shutil.which("mate-terminal"), "needs mate-terminal")
+    def test_a_terminal_reopens_with_its_tabs_in_their_folders(self):
+        #  Opens a real terminal for a second or so, then ends its shells.
+        before = {w.id for w in wl.read_windows()}
+        saved = wl.Window("0x1", 0, 0, 0, 0, 1, 1,
+                          "mate-terminal.Mate-terminal", "x",
+                          argv=[shutil.which("mate-terminal")],
+                          tabs=["/tmp", "/usr/share"])
+        self.assertTrue(wl.launch(saved))
+        new = []
+        for _ in range(75):
+            new = [w for w in wl.read_windows() if w.id not in before
+                   and w.wm_class == saved.wm_class]
+            if new and len(new[0].tabs) == 2:
+                break
+            time.sleep(0.2)
+
+        def close():
+            kids = wl._children()
+            for w in new:
+                for c in kids.get(w.pid, []):
+                    if wl._windowid(c) == int(w.id, 16):
+                        os.kill(c, 1)
+            #  Gone before the next test lists windows.
+            for _ in range(50):
+                if not {w.id for w in new} & {w.id for w in wl.read_windows()}:
+                    return
+                time.sleep(0.1)
+        self.addCleanup(close)
+        self.assertEqual(len(new), 1)
+        self.assertEqual(new[0].tabs, ["/tmp", "/usr/share"])
 
 
 if __name__ == "__main__":

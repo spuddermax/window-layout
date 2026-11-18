@@ -22,6 +22,7 @@ import hashlib
 import subprocess
 import threading
 from datetime import datetime
+from pathlib import Path
 
 import gi
 
@@ -136,6 +137,18 @@ def state_label(states: list[str]) -> str:
 def startable(st: wl.Step) -> bool:
     """Not open, but Restore can start it."""
     return st.now is None and wl.launch_argv(st.saved) is not None
+
+
+def tabs_label(tabs: list[str]) -> str:
+    """Where a terminal's tabs are: `~/projects/x`, `~/a + 2 tabs`."""
+    if not tabs:
+        return ""
+    home = str(Path.home())
+    first = tabs[0]
+    if first == home or first.startswith(home + "/"):
+        first = "~" + first[len(home):]
+    more = len(tabs) - 1
+    return first + (f" + {more} tab{'s' * (more != 1)}" if more else "")
 
 
 def summary(steps: list[wl.Step]) -> str:
@@ -531,7 +544,8 @@ class Picker(Gtk.ApplicationWindow):
             else:
                 status = "not open"
             title = st.saved.title or "(untitled)"
-            how = state_label(st.saved.states)
+            how = ", ".join(x for x in (tabs_label(st.saved.tabs),
+                                        state_label(st.saved.states)) if x)
             if how:
                 title += f"   [{how}]"
             self.list_store.append([

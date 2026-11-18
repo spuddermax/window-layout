@@ -135,10 +135,23 @@ again (detached, in that folder) and wait for the window:
   process. Its command runs once first, so a browser that restores its own
   session isn't opened twice; then whatever that didn't bring back is
   started once per window. That's how four terminals become four.
-- **Terminals** (MATE, GNOME, Xfce, Tilix, Terminator) reopen in their
-  folder, read from the default `user@host: ~/folder` title. What was
-  running *in* a terminal (an editor, Claude Code) isn't started; you get a
-  shell in that folder.
+- **Terminals** reopen where their shells were: each snapshot records
+  every tab's working directory (its `pwd`), and a window of three tabs
+  reopens as one window of three tabs, each in its own folder (MATE,
+  GNOME and Xfce terminals; Tilix and Terminator get the first tab's
+  folder). The picker shows it in the row: `[~/projects/x + 2 tabs]`.
+  What was running *in* a tab (an editor, Claude Code) isn't started; you
+  get a shell in that folder. A folder that's gone opens in home.
+- **How tabs are found:** a terminal starts each tab's shell with
+  `WINDOWID` (its window's X id) in the environment. So the shells of a
+  window are the terminal process's direct children with that WINDOWID
+  and a tab's pseudo-terminal (`/dev/pts/N`) as their input, and each
+  one's folder is `/proc/<pid>/cwd`. A terminal that doesn't set
+  WINDOWID, or a snapshot from before 2026-11-18, falls back to the
+  folder in a `user@host: ~/folder` title.
+- **A `cd` counts as a change,** so a snapshot is saved when you change
+  folders, not only when a window moves; the last snapshot has every
+  terminal where its shell last was (to within the two-minute timer).
 - **Apps that set no `_NET_WM_PID`** (xmessage), or a wrong one (Deskflow
   reports pid 2), are found by their WM_CLASS name instead, so their
   command is recorded too.
