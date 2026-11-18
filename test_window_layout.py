@@ -130,7 +130,9 @@ class Deleting(unittest.TestCase):
         patch = mock.patch.object(wl, "SNAPSHOTS", self.dir)
         patch.start()
         self.addCleanup(patch.stop)
-        self.t0 = datetime(2026, 10, 27, 19, 0, 0)
+        #  Recent: cmd_snapshot prunes against the real clock, and
+        #  snapshots past KEEP_DAYS would go out from under the test.
+        self.t0 = datetime.now().replace(microsecond=0) - timedelta(hours=1)
         self.a = wl.save([win("t.T", "a", x=1)], [], "s1", now=self.t0)
         self.b = wl.save([win("t.T", "a", x=2)], [], "s1",
                          now=self.t0 + timedelta(minutes=2))
@@ -321,6 +323,111 @@ class Storage(unittest.TestCase):
         self.assertEqual(len(wl.snapshots(self.dir)), 1)
 
 
+class Reopening(unittest.TestCase):
+    """Starting apps that aren't open: what to run, and how often."""
+
+    def saved(self, cls, title, pid, argv, cwd=""):
+        w = win(cls, title)
+        w.pid, w.argv, w.command, w.cwd = pid, argv, " ".join(argv), cwd
+        return w
+
+    def test_a_terminal_reopens_in_its_folder(self):
+        home = os.path.expanduser("~")
+        self.assertEqual(wl.terminal_dir("matthew@laptop: ~"), home)
+        self.assertEqual(wl.terminal_dir("me@box: /tmp"), "/tmp")
+        self.assertIsNone(wl.terminal_dir("✳ Claude Code"))
+        self.assertIsNone(wl.terminal_dir("me@box: ~/no/such/folder/here"))
+        t = self.saved("mate-terminal.Mate-terminal", "me@box: /tmp", 1,
+                       ["/bin/sh", "--", "x"])
+        #  Only a terminal gets the option.
+        self.assertEqual(wl.launch_argv(t), ["/bin/sh", "--", "x"])
+        with mock.patch.object(wl, "TERMINALS", {"sh"}):
+            self.assertEqual(wl.launch_argv(t),
+                             ["/bin/sh", "--working-directory=/tmp", "--", "x"])
+
+    def test_what_cannot_be_started(self):
+        self.assertIsNone(wl.launch_argv(self.saved("a.A", "", 1, [])))
+        self.assertIsNone(wl.launch_argv(
+            self.saved("a.A", "", 1, ["/no/such/program"])))
+        self.assertIsNone(wl.launch_argv(
+            self.saved("a.A", "", 1, ["no-such-program-anywhere"])))
+        #  A relative program needs the folder it ran in.
+        self.assertIsNone(wl.launch_argv(
+            self.saved("a.A", "", 1, ["bin/sh"])))
+        self.assertEqual(wl.launch_argv(
+            self.saved("a.A", "", 1, ["bin/sh"], cwd="/")), ["bin/sh"])
+
+    def test_old_snapshots_and_libreoffice(self):
+        old = win("a.A", "")
+        old.command = "sh -c true"                  # no argv recorded
+        self.assertEqual(wl.launch_argv(old), ["sh", "-c", "true"])
+        calc = self.saved("l.L", "", 1, ["/bin/sh", "--calc", "--splash-pipe=5"])
+        self.assertEqual(wl.launch_argv(calc), ["/bin/sh", "--calc"])
+
+    def test_a_window_with_no_usable_pid_is_found_by_its_class(self):
+        me = os.getpid()
+        self.assertEqual(wl.owner(me, "x.X"), me)
+        with mock.patch.object(wl, "_run", return_value="4242\n") as run:
+            self.assertEqual(wl.owner(2, "deskflow.Deskflow"), 4242)
+        self.assertEqual(run.call_args.args[-1], "deskflow")
+        gone = subprocess.CalledProcessError(1, ["pgrep"])
+        with mock.patch.object(wl, "_run", side_effect=gone):
+            self.assertEqual(wl.owner(0, "nothing.Nothing"), 0)
+
+    def test_where_it_ran_is_not_part_of_the_layout(self):
+        a, b = win("t.T", "x"), win("t.T", "x")
+        b.argv, b.cwd = ["t"], "/tmp"
+        self.assertEqual(wl._layout([a]), wl._layout([b]))
+
+    def run_reopen(self, missing, appears):
+        """reopen() against a fake desktop: `appears(w)` is the windows
+        starting saved window `w` opens.  Returns (failed, started)."""
+        desktop, started = [], []
+        clock = [0.0]
+
+        def start(w):
+            started.append(w)
+            for n, cls in enumerate(appears(w)):
+                desktop.append(win(cls, w.title))
+                desktop[-1].id = f"0x{len(desktop)}"
+            return True
+
+        def sleep(t):
+            clock[0] += t
+        failed = wl.reopen(missing, read=lambda: list(desktop), start=start,
+                           sleep=sleep, clock=lambda: clock[0])
+        return failed, started, clock[0]
+
+    def test_a_browser_is_started_once_for_its_windows(self):
+        b1 = self.saved("b.B", "Mail", 7, ["/bin/sh"])
+        b2 = self.saved("b.B", "News", 7, ["/bin/sh"])
+        #  The browser restores its session: both windows at once.
+        failed, started, _ = self.run_reopen(
+            [b1, b2], lambda w: ["b.B", "b.B"] if w is b1 else ["b.B"])
+        self.assertEqual((failed, [id(w) for w in started]), ([], [id(b1)]))
+
+    def test_terminals_are_started_once_each(self):
+        ts = [self.saved("t.T", f"me@box: /tmp", 9, ["/bin/sh"])
+              for _ in range(3)]                    # equal field for field
+        failed, started, waited = self.run_reopen(ts, lambda w: ["t.T"])
+        self.assertEqual(failed, [])
+        self.assertEqual(len(started), 3)
+        #  One quiet spell after the first, none after the rest.
+        self.assertLess(waited, wl.OPEN_QUIET_S + 1)
+
+    def test_an_app_that_shows_nothing_is_not_started_twice(self):
+        a = self.saved("a.A", "x", 1, ["/bin/sh"])
+        b = self.saved("a.A", "y", 1, ["/bin/sh"])
+        failed, started, waited = self.run_reopen([a, b], lambda w: [])
+        self.assertEqual(len(started), 1)
+        self.assertGreaterEqual(waited, wl.OPEN_WAIT_S)
+
+    def test_what_cannot_start_is_handed_back(self):
+        a = self.saved("a.A", "x", 1, [])
+        failed, started, _ = self.run_reopen([a], lambda w: ["a.A"])
+        self.assertEqual((failed, started), ([a], []))
+
+
 class Restore(unittest.TestCase):
     """cmd_restore's report, with the desktop faked."""
 
@@ -344,6 +451,53 @@ class Restore(unittest.TestCase):
         self.assertIn("1 of 2 windows are open", text)
         self.assertIn("not open now (1)", text)
         self.assertIn("$ inkscape /home/matthew/map.svg", text)
+        self.assertIn("restore --open", text)
+
+    def test_open_starts_whats_missing_then_places_it(self):
+        saved = [win("t.T", "build"), win("sh.Sh", "shell")]
+        saved[1].argv = ["/bin/sh"]
+        snap = {"path": Path("20261027-194300.json"), "taken": "x",
+                "session": "s1", "windows": saved, "monitors": []}
+        desktop = [win("t.T", "build")]
+
+        def reopen(missing):
+            self.assertEqual([w.title for w in missing], ["shell"])
+            desktop.append(win("sh.Sh", "shell"))
+            return []
+        for dry in (True, False):
+            with mock.patch.object(wl, "snapshots", return_value=[snap]), \
+                 mock.patch.object(wl, "session_key", return_value="s2"), \
+                 mock.patch.object(wl, "read_windows",
+                                   side_effect=lambda: list(desktop)), \
+                 mock.patch.object(wl, "read_monitors", return_value=[]), \
+                 mock.patch.object(wl, "desktop_count", return_value=4), \
+                 mock.patch.object(wl, "reopen", side_effect=reopen) as ro, \
+                 mock.patch.object(wl, "place") as place, \
+                 mock.patch("sys.stdout.write") as out:
+                wl.main(["restore", "--open"] + (["--dry-run"] if dry else []))
+            text = "".join(c.args[0] for c in out.call_args_list)
+            if dry:
+                ro.assert_not_called()
+                place.assert_not_called()
+                self.assertIn("would start 1", text)
+                self.assertIn("$ /bin/sh", text)
+                self.assertNotIn("not open now", text)
+            else:
+                self.assertEqual(place.call_count, 2)
+                self.assertIn("now 2 of 2 windows are open", text)
+                self.assertNotIn("not open now", text)
+
+    def test_the_tests_own_windows_are_never_snapshotted(self):
+        here = [win("t.T", "a"), win(wl.TEST_CLASS + "x.Xmessage", "x")]
+        with mock.patch.object(wl, "read_windows", return_value=here), \
+             mock.patch.object(wl, "read_monitors", return_value=[]), \
+             mock.patch.object(wl, "session_key", return_value="s"), \
+             mock.patch.object(wl, "seen_last", return_value=False), \
+             mock.patch.object(wl, "mark_checked"), \
+             mock.patch.object(wl, "prune"), \
+             mock.patch.object(wl, "save") as save:
+            wl.cmd_snapshot(SimpleNamespace(verbose=False))
+        self.assertEqual([w.title for w in save.call_args.args[0]], ["a"])
 
     def test_a_snapshot_with_no_x_display_is_skipped_quietly(self):
         gone = subprocess.CalledProcessError(1, ["wmctrl"], stderr="Cannot open display")
@@ -370,7 +524,7 @@ class Restore(unittest.TestCase):
                      and shutil.which("wmctrl"), "needs an X display")
 class Live(unittest.TestCase):
     def _open(self, name: str) -> str:
-        proc = subprocess.Popen(["xmessage", "-name", name, "-title", name,
+        proc = subprocess.Popen(["xmessage", "-name", wl.TEST_CLASS + name, "-title", name,
                                  "window-layout test window"])
 
         def close():
@@ -467,6 +621,45 @@ class Live(unittest.TestCase):
         wl.place(a, saved, saved.rect, wl.desktop_count())
         time.sleep(0.3)
         self.assertEqual(self._here(a).desktop, 1)
+
+    def test_what_ran_a_window_is_recorded(self):
+        a = self._open(f"wl-r-{os.getpid()}")
+        got = self._here(a)
+        self.assertEqual(got.argv[0], "xmessage")
+        self.assertEqual(got.cwd, os.getcwd())
+
+    def test_a_closed_window_is_started_again_and_put_back(self):
+        name = f"wl-o-{os.getpid()}"
+        proc = subprocess.Popen(["xmessage", "-name", wl.TEST_CLASS + name, "-title", name,
+                                 "window-layout reopen test"])
+        for _ in range(50):
+            here = [w for w in wl.read_windows() if w.title == name]
+            if here:
+                break
+            time.sleep(0.1)
+        wl._run("wmctrl", "-i", "-r", here[0].id, "-e", "0,333,222,300,200")
+        time.sleep(0.4)
+        saved = [w for w in wl.read_windows() if w.title == name]
+        proc.kill()
+        proc.wait()
+        time.sleep(0.3)
+        self.assertFalse([w for w in wl.read_windows() if w.title == name])
+
+        self.assertEqual(wl.reopen(saved), [])
+        back = [w for w in wl.read_windows() if w.title == name]
+
+        def close():
+            for w in back:
+                try:
+                    os.kill(w.pid, 15)
+                except OSError:
+                    pass
+        self.addCleanup(close)
+        self.assertEqual(len(back), 1)
+        step, = wl.plan(saved, back, wl.read_monitors())
+        wl.place(step.now.id, step.saved, step.rect, wl.desktop_count())
+        time.sleep(0.4)
+        self.assertEqual(self._here(back[0].id).rect, saved[0].rect)
 
 
 if __name__ == "__main__":

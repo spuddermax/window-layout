@@ -6,6 +6,7 @@
     window-layout restore           put open windows back where they were at
                                     the end of the previous X session
     window-layout restore --dry-run say what it would do, move nothing
+    window-layout restore --open    first start the apps that aren't open
     window-layout list              the sessions and snapshots on file
     window-layout delete NAME...    delete snapshots (-s: their whole
                                     sessions); undelete brings them back
@@ -22,7 +23,9 @@ How it matches: a window after a crash is a different X window, with a
 different id and often a different title (a browser's title is its tab).
 So a saved window is matched to an open one of the same WM_CLASS, the
 closest title first (`difflib`), each used once.  Saved windows nothing
-matched are listed with the command that was running them, to reopen.
+matched are listed with the command that was running them, to reopen --
+or, with `--open` (and in the picker), started again from that command,
+in the folder it ran in, and placed once their windows appear.
 
 How it moves: Marco does not hand back the coordinates it was given.  A
 window set to (300, 200) can report (312, 270) -- an offset that depends on
@@ -47,6 +50,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
@@ -83,8 +87,19 @@ STATES = {"_NET_WM_STATE_MAXIMIZED_VERT": "maximized_vert",
           "_NET_WM_STATE_HIDDEN": "hidden"}
 #: The picker's own WM_CLASS: never snapshotted, never moved.
 OWN_CLASS = "window-layout"
+#: The tests' windows' WM_CLASS starts with this: the timer, running while
+#: they do, leaves them out of the real snapshots.
+TEST_CLASS = "wltest-"
 #: How long to let the window manager act on a request before reading back.
 SETTLE_S = 0.15
+#: Starting apps: the longest to wait for their windows, per round...
+OPEN_WAIT_S = 20
+#: ...and how long no new window must appear before a round is done.
+OPEN_QUIET_S = 3
+#: Terminals that take --working-directory: one reopened from a saved
+#: window titled `user@host: ~/projects/x` opens in ~/projects/x.
+TERMINALS = {"mate-terminal", "gnome-terminal", "xfce4-terminal", "tilix",
+             "terminator"}
 
 
 @dataclass
@@ -100,6 +115,10 @@ class Window:
     title: str
     states: list[str] = field(default_factory=list)
     command: str = ""
+    #: The process's argv as it was, and the folder it ran in: what starts
+    #: it again.  (Older snapshots have only `command`, argv joined.)
+    argv: list[str] = field(default_factory=list)
+    cwd: str = ""
 
     @property
     def rect(self) -> tuple[int, int, int, int]:
@@ -167,13 +186,47 @@ def parse_monitors(text: str) -> list[Monitor]:
     return out
 
 
-def _command(pid: int) -> str:
+def _argv(pid: int) -> list[str]:
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
+        return []
+    return [part.decode(errors="replace") for part in raw.split(b"\0") if part]
+
+
+def _cwd(pid: int) -> str:
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
         return ""
-    return " ".join(part.decode(errors="replace")
-                    for part in raw.split(b"\0") if part)
+
+
+def _mine(pid: int) -> bool:
+    try:
+        return pid > 0 and os.stat(f"/proc/{pid}").st_uid == os.getuid()
+    except OSError:
+        return False
+
+
+def owner(pid: int, wm_class: str) -> int:
+    """The process behind a window.  Its _NET_WM_PID, when that is one of
+    ours with a command line; else -- xmessage sets none (0), and Deskflow
+    reports 2, a kernel thread -- the newest process of ours named after
+    the window's WM_CLASS (`deskflow.Deskflow` -> deskflow)."""
+    if _mine(pid) and _argv(pid):
+        return pid
+    name, _, cls = wm_class.rpartition(".")
+    for candidate in dict.fromkeys((name, name.lower(), cls.lower())):
+        if not candidate or len(candidate) > 15:   # past comm's length
+            continue
+        try:
+            found = _run("pgrep", "-n", "-x", "-u", str(os.getuid()),
+                         candidate).split()
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        if found:
+            return int(found[0])
+    return pid
 
 
 def read_windows() -> list[Window]:
@@ -187,7 +240,10 @@ def read_windows() -> list[Window]:
         if types & SKIP_TYPES or win.wm_class.startswith(OWN_CLASS):
             continue
         win.states = states
-        win.command = _command(win.pid)
+        win.pid = owner(win.pid, win.wm_class)
+        win.argv = _argv(win.pid)
+        win.command = " ".join(win.argv)
+        win.cwd = _cwd(win.pid)
         windows.append(win)
     return windows
 
@@ -228,7 +284,8 @@ def _layout(windows: list[Window]) -> list[dict]:
     browser's is its tab, so counting them would save a "new" layout every
     two minutes."""
     return sorted(({k: v for k, v in asdict(w).items()
-                    if k not in ("id", "pid", "title")} for w in windows),
+                    if k not in ("id", "pid", "title", "argv", "cwd")}
+                   for w in windows),
                   key=lambda d: json.dumps(d, sort_keys=True))
 
 
@@ -507,6 +564,152 @@ def plan(saved: list[Window], current: list[Window],
 
 
 # ---------------------------------------------------------------------------
+# Starting apps that aren't open
+# ---------------------------------------------------------------------------
+
+
+_PROMPT_TITLE = re.compile(r"^[^\s@]+@[^\s:]+:\s*(\S.*?)\s*$")
+
+
+def terminal_dir(title: str) -> str | None:
+    """The folder a terminal was in, from bash's default title
+    (`matthew@laptop: ~/projects/x`), if that folder is still there."""
+    m = _PROMPT_TITLE.match(title)
+    if not m:
+        return None
+    folder = os.path.expanduser(m.group(1))
+    return folder if os.path.isabs(folder) and os.path.isdir(folder) else None
+
+
+def launch_argv(w: Window) -> list[str] | None:
+    """The command that opens `w` again, or None when there is none to run:
+    no command was recorded (another user's process, or one gone before
+    the snapshot read it), or its program isn't there now."""
+    argv = list(w.argv) or w.command.split()
+    if not argv:
+        return None
+    exe = argv[0]
+    if "/" not in exe:
+        found = shutil.which(exe)
+    elif os.path.isabs(exe):
+        found = exe
+    else:                                  # `.venv/bin/python`: from its cwd
+        found = os.path.join(w.cwd, exe) if w.cwd else None
+    if not found or not os.path.isfile(found) or not os.access(found, os.X_OK):
+        return None
+    #  LibreOffice's launcher hands soffice.bin a pipe to its splash screen;
+    #  run straight, that descriptor is not there.
+    argv = [a for a in argv if not a.startswith("--splash-pipe=")]
+    if os.path.basename(exe) in TERMINALS and \
+            not any(a.startswith("--working-directory") for a in argv):
+        folder = terminal_dir(w.title)
+        if folder:
+            #  Right after the program: anything after `--` is the shell's.
+            argv.insert(1, f"--working-directory={folder}")
+    return argv
+
+
+def launch(w: Window) -> bool:
+    """Start the app of saved window `w`, detached, in the folder it ran
+    in (else home).  Returns whether it started."""
+    argv = launch_argv(w)
+    if argv is None:
+        return False
+    cwd = w.cwd if w.cwd and os.path.isdir(w.cwd) else str(Path.home())
+    try:
+        proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+    except OSError:
+        return False
+    #  Reap it when it exits (a terminal's client exits at once, handing
+    #  the window to its server), so a long-lived picker gathers no zombies.
+    threading.Thread(target=proc.wait, daemon=True).start()
+    return True
+
+
+def _await_windows(want: dict[str, int], before: set[str], read,
+                   timeout: float, quiet: float, sleep, clock) -> list[Window]:
+    """Wait for new windows (ids not in `before`): until each class in
+    `want` has that many, or none has appeared for `quiet` seconds after
+    the first, or `timeout`.  Returns the new windows."""
+    start = clock()
+    last_change, seen = None, 0
+    new: list[Window] = []
+    while True:
+        try:
+            new = [w for w in read() if w.id not in before]
+        except (OSError, subprocess.CalledProcessError):
+            new = []
+        have = {}
+        for w in new:
+            have[w.wm_class] = have.get(w.wm_class, 0) + 1
+        if all(have.get(c, 0) >= n for c, n in want.items()):
+            return new
+        now = clock()
+        if len(new) != seen:
+            seen, last_change = len(new), now
+        if now - start >= timeout or \
+                (last_change is not None and now - last_change >= quiet):
+            return new
+        sleep(0.3)
+
+
+def reopen(missing: list[Window], read=None, timeout: float = OPEN_WAIT_S,
+           quiet: float = OPEN_QUIET_S, sleep=time.sleep,
+           clock=time.monotonic, start=None) -> list[Window]:
+    """Start the apps of saved windows that aren't open, and wait for their
+    windows.  Returns the saved windows that could not be started.
+
+    Two rounds.  The saved windows of one process (a browser's windows,
+    every window of a terminal server) are started once first: a browser
+    restores its own session, and starting it once per window would open
+    each of them twice.  Then whatever that didn't bring back is started
+    once per window -- the terminals, and browser windows its session
+    didn't have.  An app none of whose windows came up in the first
+    round isn't started again."""
+    read = read or read_windows
+    start = start or launch
+    try:
+        before = {w.id for w in read()}
+    except (OSError, subprocess.CalledProcessError):
+        before = set()
+    runnable = [w for w in missing if launch_argv(w) is not None]
+    failed = [w for w in missing if launch_argv(w) is None]
+    want: dict[str, int] = {}
+    for w in runnable:
+        want[w.wm_class] = want.get(w.wm_class, 0) + 1
+
+    def wait():
+        return _await_windows(want, before, read, timeout, quiet, sleep, clock)
+
+    firsts, seen = [], set()
+    for w in runnable:
+        key = (w.wm_class, w.pid)
+        if key not in seen:
+            seen.add(key)
+            firsts.append(w)
+    #  By identity: two saved terminals can be equal field for field.
+    dud = {id(w) for w in firsts if not start(w)}
+    failed += [w for w in firsts if id(w) in dud]
+    if len(dud) == len(firsts):
+        return failed
+    new = wait()
+    #  Which saved windows did that bring back?  Matched like a restore.
+    #  An app with no window yet is slow or opens some other class of
+    #  window: starting it again would only make two.
+    covered = {id(s) for s, _ in match(runnable, new)}
+    arrived = {w.wm_class for w in new}
+    again = [w for w in runnable if id(w) not in covered and
+             id(w) not in dud and w.wm_class in arrived]
+    if again:
+        failed += [w for w in again if not start(w)]
+        wait()
+    return failed
+
+
+# ---------------------------------------------------------------------------
 # Moving windows
 # ---------------------------------------------------------------------------
 
@@ -564,7 +767,8 @@ def cmd_snapshot(args) -> int:
     #  that is not there (yet, or any more) is a skipped snapshot, not an
     #  error in the journal every two minutes.
     try:
-        windows = read_windows()
+        windows = [w for w in read_windows()
+                   if not w.wm_class.startswith(TEST_CLASS)]
     except (OSError, subprocess.CalledProcessError):
         if args.verbose:
             print("no X display to read; skipped")
@@ -603,12 +807,29 @@ def cmd_restore(args) -> int:
               f"`window-layout list` shows what there is", file=sys.stderr)
         return 1
     steps = plan(snap["windows"], read_windows(), read_monitors())
+    opening = getattr(args, "open", False)
+    print(f"restoring {snap['path'].name} (taken {snap['taken']}): "
+          f"{sum(1 for st in steps if st.now)} of {len(steps)} windows "
+          f"are open" + (" -- dry run" if args.dry_run else ""))
+    if opening:
+        closed = [st.saved for st in steps if not st.now]
+        runnable = [s for s in closed if launch_argv(s) is not None]
+        if runnable:
+            print(f"{'would start' if args.dry_run else 'starting'} "
+                  f"{len(runnable)} that are not open:")
+            for s in runnable:
+                print(f"  {app_name(s):<16} {_short(s.title, 50):<50} "
+                      f"$ {_short(' '.join(launch_argv(s)), 60)}")
+            if not args.dry_run:
+                reopen(closed)
+                steps = plan(snap["windows"], read_windows(), read_monitors())
     desktops = desktop_count()
     placed = [st for st in steps if st.now]
     missing = [st.saved for st in steps if not st.now]
-    print(f"restoring {snap['path'].name} (taken {snap['taken']}): "
-          f"{len(placed)} of {len(steps)} windows are open"
-          + (" -- dry run" if args.dry_run else ""))
+    if opening and not args.dry_run:
+        print(f"now {len(placed)} of {len(steps)} windows are open")
+    elif opening:                          # listed above, as would start
+        missing = [s for s in missing if launch_argv(s) is None]
     for st in placed:
         x, y, w, h = st.rect
         state = f" [{', '.join(st.saved.states)}]" if st.saved.states else ""
@@ -632,7 +853,9 @@ def cmd_restore(args) -> int:
                         "Window layout restored", body], capture_output=True)
     if missing:
         print(f"\nnot open now ({len(missing)}) -- open these and run "
-              f"`window-layout restore` again to place them:")
+              f"`window-layout restore` again to place them"
+              + ("" if opening else
+                 ", or `window-layout restore --open` to start them") + ":")
         for s in missing:
             print(f"  {app_name(s):<16} {_short(s.title, 50)}")
             if s.command:
@@ -707,6 +930,9 @@ def main(argv: list[str] | None = None) -> int:
                         "before this one), latest, or a snapshot name")
     p.add_argument("-n", "--dry-run", action="store_true",
                    help="say what would move, move nothing")
+    p.add_argument("-o", "--open", action="store_true",
+                   help="first start the apps that aren't open, from the "
+                        "command each was running, then place them")
     p.add_argument("--notify", action="store_true",
                    help="also say how it went in a desktop notification "
                         "(for the menu entry)")

@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=Restore Window Layout
-Comment=Put open windows back where they were before the last crash or logout
-Exec=/home/matthew/projects/window-layout/window_layout.py restore --notify
+Comment=Start the apps that were open before the last crash or logout, and put every window back where it was
+Exec=/home/matthew/projects/window-layout/window_layout.py restore --open --notify
 Icon=window-layout
 Terminal=false
 Categories=Utility;

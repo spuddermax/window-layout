@@ -4,11 +4,12 @@
 The picker over `window_layout`: every snapshot on file, grouped by the X
 session it was taken in, with the session before this one -- the layout a
 crash or logout lost -- chosen to start.  Choosing a snapshot draws it to
-scale, workspace by workspace, and lists its windows: each one either open
-now (ticked, and moved by Restore) or not open (with the command that ran
-it).  Untick a window to leave it where it is.  The list follows the
-desktop while the picker is open, so an app you open from here on joins
-the restore without reopening the picker.
+scale, workspace by workspace, and lists its windows: each one open now
+(moved by Restore), not open but startable (Restore starts it from the
+command it was running, then places it), or not open with nothing to run.
+Untick a window to leave it alone.  The list follows the desktop while the
+picker is open, so an app you open from here on joins the restore without
+reopening the picker.
 
 Snapshots can be deleted one at a time or a session at a time (the trash
 button, the Delete key, or a right-click), with Undo.
@@ -132,11 +133,20 @@ def state_label(states: list[str]) -> str:
     return ", ".join(words)
 
 
+def startable(st: wl.Step) -> bool:
+    """Not open, but Restore can start it."""
+    return st.now is None and wl.launch_argv(st.saved) is not None
+
+
 def summary(steps: list[wl.Step]) -> str:
     open_ = sum(1 for st in steps if st.now)
     text = f"{open_} of {windows(len(steps))} " \
            f"{'is' if open_ == 1 and len(steps) == 1 else 'are'} open now"
-    missing = sorted({wl.app_name(st.saved) for st in steps if not st.now})
+    start = sorted({wl.app_name(st.saved) for st in steps if startable(st)})
+    if start:
+        text += f"  ·  can be started: {', '.join(start)}"
+    missing = sorted({wl.app_name(st.saved) for st in steps
+                      if not st.now and not startable(st)})
     if missing:
         text += f"  ·  not open: {', '.join(missing)}"
     return text
@@ -300,6 +310,8 @@ class Picker(Gtk.ApplicationWindow):
         #  kept across the periodic refresh.
         self.unticked: set[int] = set()
         self.busy = False
+        #  The snapshot the window list was last built for.
+        self.planned: dict | None = None
 
         self.header = header = Gtk.HeaderBar(show_close_button=True,
                                              title="Window Layouts")
@@ -497,7 +509,8 @@ class Picker(Gtk.ApplicationWindow):
         #  every few seconds, and a rebuild would reset the scroll.
         same = [(st.now and st.now.id, st.offscreen) for st in steps] == \
             [(st.now and st.now.id, st.offscreen) for st in self.steps] and \
-            len(self.list_store) == len(steps)
+            len(self.list_store) == len(steps) and self.snap is self.planned
+        self.planned = self.snap
         self.steps = steps
         if not same:
             self.fill_list()
@@ -509,9 +522,12 @@ class Picker(Gtk.ApplicationWindow):
         picked = self.selected_index()
         self.list_store.clear()
         for i, st in enumerate(self.steps):
+            can = bool(st.now) or startable(st)
             if st.now:
                 status = "open" + ("  (screen gone: fitted)"
                                    if st.offscreen else "")
+            elif can:
+                status = "can start"
             else:
                 status = "not open"
             title = st.saved.title or "(untitled)"
@@ -519,7 +535,7 @@ class Picker(Gtk.ApplicationWindow):
             if how:
                 title += f"   [{how}]"
             self.list_store.append([
-                bool(st.now) and i not in self.unticked, bool(st.now),
+                can and i not in self.unticked, can,
                 app_icon(st.saved.wm_class), wl.app_name(st.saved), title,
                 wl.workspace_label(st.saved), status, i, not st.now])
         if picked is not None and picked < len(self.list_store):
@@ -548,9 +564,16 @@ class Picker(Gtk.ApplicationWindow):
         return model[it][W_INDEX] if it else None
 
     def update_button(self):
-        n = sum(1 for row in self.list_store if row[W_TICK])
+        ticked = [row[W_INDEX] for row in self.list_store if row[W_TICK]]
+        n = len(ticked)
+        start = sum(1 for i in ticked
+                    if i < len(self.steps) and not self.steps[i].now)
         self.restore_button.set_label(f"Restore {windows(n)}" if n
                                       else "Restore")
+        self.restore_button.set_tooltip_text(
+            f"Start {start} that {'is' if start == 1 else 'are'} not open, "
+            f"then put all {n} back" if start else
+            "Put the ticked windows back")
         self.restore_button.set_sensitive(n > 0 and not self.busy)
 
     # -- events ----------------------------------------------------------
@@ -687,35 +710,58 @@ class Picker(Gtk.ApplicationWindow):
         return True
 
     def on_restore(self, button):
-        ticked = [self.steps[row[W_INDEX]] for row in self.list_store
-                  if row[W_TICK]]
-        if not ticked:
+        ticked = [row[W_INDEX] for row in self.list_store if row[W_TICK]]
+        if not ticked or not self.snap:
             return
         self.busy = True
         self.update_button()
-        self.status.set_text(f"Putting back {windows(len(ticked))}…")
-        threading.Thread(target=self._restore, args=(ticked,),
+        closed = [self.steps[i].saved for i in ticked if not self.steps[i].now]
+        self.status.set_text(
+            f"Starting {windows(len(closed))}…" if closed else
+            f"Putting back {windows(len(ticked))}…")
+        threading.Thread(target=self._restore,
+                         args=(self.snap, list(self.steps), ticked, closed),
                          daemon=True).start()
 
-    def _restore(self, steps):
-        """Off the GTK thread: placing a window waits on the window
-        manager, and the picker should not freeze while it does."""
+    def _restore(self, snap, steps, ticked, closed):
+        """Off the GTK thread: starting apps and placing windows wait on
+        them and on the window manager, and the picker should not freeze
+        while they do."""
+        unstarted = []
+        if closed:
+            unstarted = wl.reopen(closed)
+            #  Matched again: the new windows, and every saved window's
+            #  place in the snapshot, ticked by position, as before.
+            try:
+                current, monitors = wl.read_windows(), wl.read_monitors()
+            except (OSError, subprocess.CalledProcessError):
+                current, monitors = [], []
+            steps = wl.plan(snap["windows"], current, monitors)
+            GLib.idle_add(self.status.set_text,
+                          f"Putting back {windows(len(ticked))}…")
         desktops = wl.desktop_count()
-        failed = []
-        for st in steps:
+        moved, failed = [], []
+        for i in ticked:
+            st = steps[i]
+            if not st.now:
+                continue
             try:
                 wl.place(st.now.id, st.saved, st.rect, desktops)
+                moved.append(st)
             except subprocess.CalledProcessError:
                 failed.append(st)
-        GLib.idle_add(self._restored, len(steps) - len(failed), failed)
+        GLib.idle_add(self._restored, len(moved), failed, unstarted)
 
-    def _restored(self, done, failed):
+    def _restored(self, done, failed, unstarted=()):
         self.busy = False
         self.replan()
         text = f"Put back {windows(done)}."
         if failed:
             text += "  Could not move: " + ", ".join(
                 wl.app_name(st.saved) for st in failed) + "."
+        if unstarted:
+            text += "  Could not start: " + ", ".join(
+                sorted({wl.app_name(w) for w in unstarted})) + "."
         missing = sorted({wl.app_name(st.saved) for st in self.steps
                           if not st.now})
         if missing:

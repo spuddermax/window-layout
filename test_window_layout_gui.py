@@ -112,6 +112,11 @@ class Helpers(unittest.TestCase):
         steps = [wl.Step(a, a, a.rect), wl.Step(b, None, b.rect)]
         self.assertEqual(gui.summary(steps),
                          "1 of 2 windows are open now  ·  not open: Inkscape")
+        c = wl.Window("0x3", 0, 1, 0, 0, 1, 1, "s.Shell", "", argv=["/bin/sh"])
+        steps.append(wl.Step(c, None, c.rect))
+        self.assertEqual(gui.summary(steps),
+                         "1 of 3 windows are open now  ·  can be started: "
+                         "Shell  ·  not open: Inkscape")
 
 
 @unittest.skipUnless(HAVE_X, "needs an X display")
@@ -131,7 +136,7 @@ class PickerLive(unittest.TestCase):
         self.stamp = str(os.getpid())
 
     def _open(self, name: str) -> str:
-        proc = subprocess.Popen(["xmessage", "-name", name, "-title", name,
+        proc = subprocess.Popen(["xmessage", "-name", wl.TEST_CLASS + name, "-title", name,
                                  "picker test window"])
 
         def close():
@@ -215,6 +220,51 @@ class PickerLive(unittest.TestCase):
         self.assertEqual(now[f"pk-a-{self.stamp}"], saved[f"pk-a-{self.stamp}"])
         self.assertEqual(now[f"pk-b-{self.stamp}"],
                          scrambled[f"pk-b-{self.stamp}"])
+
+    def test_a_window_that_is_not_open_is_started_and_put_back(self):
+        name = f"pk-o-{self.stamp}"
+        proc = subprocess.Popen(["xmessage", "-name", wl.TEST_CLASS + name, "-title", name,
+                                 "picker reopen test"])
+        for _ in range(50):
+            if self._ours():
+                break
+            time.sleep(0.1)
+        wid = self._ours()[0].id
+        wl._run("wmctrl", "-i", "-r", wid, "-e", "0,420,310,300,200")
+        time.sleep(0.4)
+        saved = self._ours()
+        wl.save(saved, wl.read_monitors(), "lost-session")
+        proc.kill()
+        proc.wait()
+        time.sleep(0.3)
+
+        picker = self._picker()
+        row, = [r for r in picker.list_store if r[gui.W_TITLE] == name]
+        self.assertEqual(row[gui.W_STATUS], "can start")
+        self.assertTrue(row[gui.W_CAN] and row[gui.W_TICK])
+        self.assertEqual(picker.restore_button.get_label(), "Restore 1 window")
+        self.assertIn("Start 1", picker.restore_button.get_tooltip_text())
+
+        picker.restore_button.clicked()
+        for _ in range(400):
+            self._pump(0.05)
+            if not picker.busy:
+                break
+        back = self._ours()
+
+        def close():
+            for w in back:
+                try:
+                    os.kill(w.pid, 15)
+                except OSError:
+                    pass
+        self.addCleanup(close)
+        self.assertFalse(picker.busy)
+        self.assertEqual(len(back), 1)
+        self.assertIn("Put back 1 window.", picker.status.get_text())
+        self.assertEqual(back[0].rect, saved[0].rect)
+        row, = [r for r in picker.list_store if r[gui.W_TITLE] == name]
+        self.assertEqual(row[gui.W_STATUS], "open")
 
     def test_the_picker_is_never_part_of_a_layout(self):
         picker = self._picker()
