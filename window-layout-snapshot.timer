@@ -1,6 +1,6 @@
 [Unit]
 Description=Snapshot the desktop window layout every two minutes
-Documentation=file:///home/matthew/projects/window-layout/README.md
+Documentation=https://github.com/spuddermax/window-layout#readme
 
 [Timer]
 OnStartupSec=60

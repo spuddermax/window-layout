@@ -1,9 +1,9 @@
 [Unit]
 Description=Snapshot the desktop window layout
-Documentation=file:///home/matthew/projects/window-layout/README.md
+Documentation=https://github.com/spuddermax/window-layout#readme
 
 [Service]
 Type=oneshot
-ExecStart=/home/matthew/projects/window-layout/window_layout.py snapshot
+ExecStart=@BIN@/window-layout snapshot
 Nice=10
 IOSchedulingClass=idle

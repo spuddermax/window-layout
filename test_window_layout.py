@@ -434,7 +434,7 @@ class Restore(unittest.TestCase):
     def test_report_names_whats_missing_and_how_it_ran(self):
         saved = [win("t.T", "build", 10, 20, 300, 200),
                  win("ink.Inkscape", "map.svg - Inkscape", 0, 0, 900, 700)]
-        saved[1].command = "inkscape /home/matthew/map.svg"
+        saved[1].command = "inkscape /home/user/map.svg"
         snap = {"path": Path("20261027-194300.json"), "taken": "x",
                 "session": "s1", "windows": saved, "monitors": []}
         now = [win("t.T", "build")]
@@ -450,7 +450,7 @@ class Restore(unittest.TestCase):
         text = "".join(c.args[0] for c in out.call_args_list)
         self.assertIn("1 of 2 windows are open", text)
         self.assertIn("not open now (1)", text)
-        self.assertIn("$ inkscape /home/matthew/map.svg", text)
+        self.assertIn("$ inkscape /home/user/map.svg", text)
         self.assertIn("restore --open", text)
 
     def test_open_starts_whats_missing_then_places_it(self):

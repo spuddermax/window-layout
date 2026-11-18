@@ -1,11 +1,48 @@
 # window-layout
 
-Records where every window on the desktop is, every two minutes, and puts
-open windows back after a crash, a logout or a reboot.
+Records where every window on the desktop is, every two minutes, and after
+a crash, a logout or a reboot, starts your apps again and puts every window
+back.
+
+For X11 desktops with an EWMH window manager; built on Linux Mint MATE
+(Marco). Wayland sessions are not supported: there, apps can't read or set
+other windows' positions.
 
 Built 2026-10-27, after an out-of-memory thrash took the X session down and
 a dozen windows' layout went with it. MATE's session autosave was off and
 nothing else had written the layout down.
+
+## Installing
+
+```
+git clone https://github.com/spuddermax/window-layout.git
+cd window-layout
+./install.sh
+```
+
+That's all; it installs for your user only, no `sudo`. The installer:
+
+- checks for what it needs (`python3` with GTK 3, `wmctrl`, `xprop`,
+  `xdotool`, `xrandr`, `pgrep`) and, if anything is missing, prints the
+  `apt install` line that gets it;
+- links `window-layout` and `window-layouts` into `~/.local/bin` (or
+  `$BINDIR`), pointing at the clone, so a `git pull` updates them;
+- writes the menu entries, the desktop icon and the systemd user timer
+  with your paths filled in, and starts the timer.
+
+Keep the clone where it is: the commands run from it. If you move it,
+run `./install.sh` again from the new place. Running it again is always
+safe.
+
+| Option | |
+|---|---|
+| `--no-desktop-icon` | skip the icon on the desktop |
+| `--uninstall` | remove everything it installed; snapshots are kept |
+| `--uninstall --purge` | ...and delete the snapshots too |
+
+Where things go follows `$BINDIR`, `$XDG_DATA_HOME`, `$XDG_CONFIG_HOME`,
+`$XDG_STATE_HOME` and the desktop folder from `xdg-user-dir`, with the
+usual defaults (the table under [Files](#files)).
 
 ## Using it
 
@@ -155,14 +192,19 @@ ones, and `restore <name>` picks one.
 
 | What | Where |
 |---|---|
-| The tool (stdlib Python, needs `wmctrl`, `xprop`, `xdotool`) | `window_layout.py`, symlinked as `~/.local/bin/window-layout` |
-| The picker (GTK 3) | `window_layout_gui.py`, symlinked as `~/.local/bin/window-layouts` |
-| Tests | `test_window_layout.py` and `test_window_layout_gui.py`, run with `python3 -m unittest -v` here. The live tests open xmessage windows on `$DISPLAY`, and the picker tests click the real Restore button. |
+| The tool (stdlib Python) | `window_layout.py`, linked as `~/.local/bin/window-layout` |
+| The picker (GTK 3) | `window_layout_gui.py`, linked as `~/.local/bin/window-layouts` |
+| Installer | `install.sh` |
+| Tests | `test_window_layout.py`, `test_window_layout_gui.py` and `test_install.py`, run with `python3 -m unittest -v` here. The live tests open xmessage windows on `$DISPLAY` (the timer leaves them out of your snapshots), and the picker tests click the real Restore button. The installer tests install into a throwaway home with `systemctl` stubbed out. |
 | Icon | `window-layout.svg`, linked into `~/.local/share/icons/hicolor/scalable/apps/` |
 | Desktop icon | `~/Desktop/window-layouts.desktop`, executable and marked trusted, so Caja runs it without asking |
 | Timer and service | `~/.config/systemd/user/window-layout-snapshot.{timer,service}` |
 | Menu entries | `~/.local/share/applications/window-layouts.desktop` (picker), `window-layout-restore.desktop` (one-click restore) |
 | Snapshots | `~/.local/state/window-layout/snapshots/` |
+
+The `.desktop`, `.service` and `.timer` files in the clone are templates:
+`@BIN@` stands for the folder the commands are installed in, and
+`install.sh` fills it in.
 
 To check that it's running, `window-layout list` starts with when it last
 checked, or:
@@ -172,10 +214,10 @@ systemctl --user list-timers window-layout-snapshot.timer
 journalctl --user -u window-layout-snapshot
 ```
 
-To remove it:
+If the timer runs but nothing is ever saved, the systemd user manager
+probably has no `DISPLAY` (the installer warns about this). Add
+`systemctl --user import-environment DISPLAY XAUTHORITY` to your session's
+startup programs.
 
-```
-systemctl --user disable --now window-layout-snapshot.timer
-```
-
-Then delete the files in the table above, and the desktop icon.
+To remove it: `./install.sh --uninstall` (add `--purge` to delete the
+snapshots as well).
